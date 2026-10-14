@@ -411,7 +411,7 @@ export class P2PTransferEngine {
         return;
       }
       try {
-        payload = await this.e2ee.decryptChunk(chunkIndex, payload);
+        payload = (await this.e2ee.decryptChunk(chunkIndex, payload)) as any;
       } catch (err) {
         console.error(`E2EE decryption authentication failed for file ${fileIndex} chunk ${chunkIndex}:`, err);
         return;

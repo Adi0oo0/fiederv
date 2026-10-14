@@ -55,7 +55,7 @@ export class E2EESession {
 
     this.cryptoKey = await crypto.subtle.importKey(
       'raw',
-      rawKey,
+      rawKey as any,
       { name: 'AES-GCM' },
       false,
       ['encrypt', 'decrypt']
@@ -94,10 +94,10 @@ export class E2EESession {
     const ciphertextBuffer = await crypto.subtle.encrypt(
       {
         name: 'AES-GCM',
-        iv: nonce,
+        iv: nonce as any,
       },
       this.cryptoKey,
-      plaintext
+      plaintext as any
     );
 
     return new Uint8Array(ciphertextBuffer);
@@ -114,10 +114,10 @@ export class E2EESession {
     const plaintextBuffer = await crypto.subtle.decrypt(
       {
         name: 'AES-GCM',
-        iv: nonce,
+        iv: nonce as any,
       },
       this.cryptoKey,
-      ciphertext
+      ciphertext as any
     );
 
     return new Uint8Array(plaintextBuffer);

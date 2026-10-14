@@ -13,6 +13,7 @@ export interface SignalingPeer {
   ip: string;
   isAlive: boolean;
   lastSeen: number;
+  httpQueue?: any[];
 }
 
 export interface SignalingRoom {
@@ -99,9 +100,11 @@ export class SignalingHub {
     }
 
     // Authenticate if authSecret was set by initiator
-    if (room.authSecret && authSecret && room.authSecret !== authSecret) {
-      return { isInitiator: false, isLanPeer: false, error: 'Invalid room authorization token.' };
-    } else if (!room.authSecret && authSecret) {
+    if (room.authSecret) {
+      if (!authSecret || room.authSecret !== authSecret) {
+        return { isInitiator: false, isLanPeer: false, error: 'Invalid room authorization token.' };
+      }
+    } else if (authSecret) {
       room.authSecret = authSecret;
     }
 
@@ -110,15 +113,24 @@ export class SignalingHub {
       return { isInitiator: false, isLanPeer: false, error: 'Room is full (max 2 peers).' };
     }
 
-    const peer: SignalingPeer = {
-      id: peerId,
-      ws,
-      ip,
-      isAlive: true,
-      lastSeen: Date.now(),
-    };
+    let peer = room.peers.get(peerId);
+    if (!peer) {
+      peer = {
+        id: peerId,
+        ws,
+        ip,
+        isAlive: true,
+        lastSeen: Date.now(),
+        httpQueue: [],
+      };
+      room.peers.set(peerId, peer);
+    } else {
+      if (ws) peer.ws = ws;
+      peer.ip = ip;
+      peer.lastSeen = Date.now();
+    }
 
-    const isInitiator = room.peers.size === 0;
+    const isInitiator = room.peers.size === 1;
     let isLanPeer = false;
 
     // Check if other peer in room shares same IP or local subnet
@@ -137,20 +149,29 @@ export class SignalingHub {
         });
 
         // Notify joining peer
-        if (ws) {
-          this.sendToPeer(peer, {
-            type: 'peer_joined',
-            peerId: existingId,
-            initiator: false,
-            isLanPeer,
-          });
-        }
+        this.sendToPeer(peer, {
+          type: 'peer_joined',
+          peerId: existingId,
+          initiator: false,
+          isLanPeer,
+        });
       }
     }
 
-    room.peers.set(peerId, peer);
     room.lastActivity = Date.now();
     return { isInitiator, isLanPeer };
+  }
+
+  public pollMessages(roomId: string, peerId: string): any[] {
+    const room = this.rooms.get(roomId);
+    if (!room) return [];
+    room.lastActivity = Date.now();
+    const peer = room.peers.get(peerId);
+    if (!peer || !peer.httpQueue || peer.httpQueue.length === 0) return [];
+    const messages = [...peer.httpQueue];
+    peer.httpQueue = [];
+    peer.lastSeen = Date.now();
+    return messages;
   }
 
   public broadcastToRoom(roomId: string, senderPeerId: string, message: any): void {
@@ -187,6 +208,12 @@ export class SignalingHub {
         peer.ws.send(JSON.stringify(msg));
       } catch (e) {
         console.warn(`Failed to send to peer ${peer.id}:`, e);
+      }
+    } else {
+      if (!peer.httpQueue) peer.httpQueue = [];
+      peer.httpQueue.push(msg);
+      if (peer.httpQueue.length > 100) {
+        peer.httpQueue.shift();
       }
     }
   }

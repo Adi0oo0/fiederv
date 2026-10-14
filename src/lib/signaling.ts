@@ -4,6 +4,7 @@ export interface SignalingMessage {
   peerId?: string;
   fromPeerId?: string;
   initiator?: boolean;
+  authSecret?: string;
   payload?: any;
   errorType?: string;
   message?: string;
@@ -177,7 +178,7 @@ export class SignalingClient {
     };
   }
 
-  public async createRoom(requestedCode?: string) {
+  public async createRoom(requestedCode?: string, authSecret?: string) {
     if (this.currentRoomId && (!requestedCode || this.currentRoomId !== requestedCode)) {
       await this.leaveRoom();
     }
@@ -187,7 +188,7 @@ export class SignalingClient {
         const res = await fetch('/api/signaling/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ requestedCode, peerId: this.myPeerId }),
+          body: JSON.stringify({ requestedCode, peerId: this.myPeerId, authSecret }),
         });
         if (res.ok) {
           const data = await res.json();
@@ -218,18 +219,19 @@ export class SignalingClient {
     }
 
     if (this.isHttpMode) {
-      this.createRoom(requestedCode);
+      this.createRoom(requestedCode, authSecret);
       return;
     }
 
     this.send({
       type: 'create_room',
       peerId: this.myPeerId,
+      authSecret,
       payload: { code: requestedCode },
     });
   }
 
-  public async joinRoom(roomId: string) {
+  public async joinRoom(roomId: string, authSecret?: string) {
     if (this.currentRoomId && this.currentRoomId !== roomId) {
       await this.leaveRoom();
     }
@@ -240,7 +242,7 @@ export class SignalingClient {
         const res = await fetch('/api/signaling/join', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ roomId, peerId: this.myPeerId }),
+          body: JSON.stringify({ roomId, peerId: this.myPeerId, authSecret }),
         });
         if (res.ok) {
           const data = await res.json();
@@ -272,7 +274,7 @@ export class SignalingClient {
     }
 
     if (this.isHttpMode) {
-      this.joinRoom(roomId);
+      this.joinRoom(roomId, authSecret);
       return;
     }
 
@@ -280,6 +282,7 @@ export class SignalingClient {
       type: 'join_room',
       roomId,
       peerId: this.myPeerId,
+      authSecret,
     });
   }
 

@@ -10,7 +10,9 @@ export interface TransferManifest {
   chunkSize: number;
   totalChunks: number;
   merkleRoot: string;
-  salt: string; // 8-char hex (4 bytes) for AES-GCM nonce salt
+  salt?: string; // 8-char hex (4 bytes) for AES-GCM nonce salt
+  saltHex?: string;
+  createdAt?: number;
   isFolder?: boolean;
   folderManifest?: FolderItem[];
 }

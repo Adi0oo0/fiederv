@@ -9,7 +9,7 @@ export class Hasher {
    * Returns a 32-byte Uint8Array.
    */
   public static async hashChunk(data: Uint8Array): Promise<Uint8Array> {
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data as any);
     return new Uint8Array(hashBuffer);
   }
 
@@ -31,7 +31,7 @@ export class Hasher {
     combined.set(left, 1);
     combined.set(right, 1 + left.length);
 
-    const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', combined as any);
     return new Uint8Array(hashBuffer);
   }
 

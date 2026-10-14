@@ -26,6 +26,10 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [channelStats, setChannelStats] = useState<ChannelStat[]>([]);
   const [e2eeKey, setE2eeKey] = useState<string>('');
+  const e2eeKeyRef = useRef<string>(e2eeKey);
+  useEffect(() => {
+    e2eeKeyRef.current = e2eeKey;
+  }, [e2eeKey]);
 
   // Files to send
   const [filesToSend, setFilesToSend] = useState<File[]>([]);
@@ -165,12 +169,14 @@ export default function App() {
     }
 
     // Check E2EE key in URL hash (#key=<keyHex>.<saltHex>)
+    let initialKey = '';
     const hash = window.location.hash;
     const keyMatch = hash.match(/key=([a-fA-F0-9]{64}\.[a-fA-F0-9]{8})/);
 
     if (keyMatch) {
-      const parsedKey = keyMatch[1];
-      setE2eeKey(parsedKey);
+      initialKey = keyMatch[1];
+      setE2eeKey(initialKey);
+      e2eeKeyRef.current = initialKey;
       // Strip key fragment from location bar to prevent XSS fragment leaks
       const cleanUrl = window.location.pathname + window.location.search;
       window.history.replaceState({}, '', cleanUrl);
@@ -204,7 +210,7 @@ export default function App() {
             signaling.sendSignal({
               type: 'manifest_init',
               manifest: activeManifestRef.current,
-              keyFragment: e2eeKey,
+              keyFragment: e2eeKeyRef.current,
             });
           }
           break;
@@ -223,8 +229,11 @@ export default function App() {
           if (payload.type === 'manifest_init' && payload.manifest) {
             setIncomingManifest(payload.manifest);
             activeManifestRef.current = payload.manifest;
-            if (payload.keyFragment && !e2eeKey) {
+            if (payload.keyFragment && !e2eeKeyRef.current) {
               setE2eeKey(payload.keyFragment);
+              e2eeKeyRef.current = payload.keyFragment;
+              const engine = getOrCreateEngine();
+              engine.crypto.initFromFragment(payload.keyFragment).catch(console.error);
             }
           } else if (payload.type === 'p2p_signal' && payload.signal) {
             const engine = getOrCreateEngine();
@@ -247,15 +256,33 @@ export default function App() {
 
     signaling
       .connect()
-      .then(() => {
+      .then(async () => {
+        const engine = getOrCreateEngine();
         if (isValidUrlCode && urlCode) {
           setConnectionState('connecting_peer');
           setRoomCode(urlCode);
           setIsGeneratingCode(false);
-          signaling.joinRoom(urlCode);
+          let authSecret: string | undefined;
+          if (initialKey) {
+            try {
+              await engine.crypto.initFromFragment(initialKey);
+              authSecret = engine.crypto.getAuthSecret();
+            } catch (e) {
+              console.warn('Failed to parse fragment authSecret', e);
+            }
+          }
+          signaling.joinRoom(urlCode, authSecret);
         } else {
           setIsGeneratingCode(true);
-          signaling.createRoom();
+          try {
+            const derived = await engine.crypto.generateKey();
+            setE2eeKey(derived.fragment);
+            e2eeKeyRef.current = derived.fragment;
+            signaling.createRoom(undefined, derived.authSecret);
+          } catch (e) {
+            console.error('Failed to generate upfront encryption key:', e);
+            signaling.createRoom();
+          }
         }
       })
       .catch((e) => {
@@ -269,7 +296,7 @@ export default function App() {
       signaling.disconnect();
       engineRef.current?.cancel();
     };
-  }, [fetchIceServers, getOrCreateEngine, e2eeKey]);
+  }, [fetchIceServers, getOrCreateEngine]);
 
   const handleModeChange = (newMode: 'send' | 'receive') => {
     if (newMode === mode) return;
@@ -289,7 +316,19 @@ export default function App() {
       setIsGeneratingCode(true);
       setRoomCode('');
       setHostRoomCode('');
-      signalingRef.current?.createRoom();
+
+      if (newMode === 'send') {
+        const engine = getOrCreateEngine();
+        engine.crypto.generateKey().then((derived) => {
+          setE2eeKey(derived.fragment);
+          e2eeKeyRef.current = derived.fragment;
+          signalingRef.current?.createRoom(undefined, derived.authSecret);
+        }).catch(() => {
+          signalingRef.current?.createRoom();
+        });
+      } else {
+        signalingRef.current?.createRoom();
+      }
     }
   };
 
@@ -300,7 +339,14 @@ export default function App() {
     setErrorMessage(null);
     setConnectionState('disconnected');
     engineRef.current?.cancel();
-    signalingRef.current?.createRoom();
+    const engine = getOrCreateEngine();
+    engine.crypto.generateKey().then((derived) => {
+      setE2eeKey(derived.fragment);
+      e2eeKeyRef.current = derived.fragment;
+      signalingRef.current?.createRoom(undefined, derived.authSecret);
+    }).catch(() => {
+      signalingRef.current?.createRoom();
+    });
   };
 
   const handleJoinManualCode = (code: string) => {
@@ -312,7 +358,9 @@ export default function App() {
     setErrorMessage(null);
     setConnectionState('connecting_peer');
     engineRef.current?.cancel();
-    signalingRef.current?.joinRoom(clean);
+    const engine = getOrCreateEngine();
+    const authSecret = engine.crypto.isReady() ? engine.crypto.getAuthSecret() : undefined;
+    signalingRef.current?.joinRoom(clean, authSecret);
     setRoomCode(clean);
   };
 

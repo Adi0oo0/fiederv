@@ -97,8 +97,20 @@ export class TransferEngine {
   ): Promise<{ manifest: TransferManifest; shareUrl: string; keyFragment: string; authSecret: string }> {
     this.setState('waiting_peer');
 
-    // 1. Generate master key and derive subkeys
-    const { saltHex, fragment, authSecret } = await this.crypto.generateKey();
+    // 1. Generate master key and derive subkeys (or reuse upfront key)
+    let saltHex: string;
+    let fragment: string;
+    let authSecret: string;
+    if (this.crypto.isReady() && this.crypto.getAuthSecret()) {
+      saltHex = this.crypto.getSaltHex();
+      fragment = this.crypto.getFragment();
+      authSecret = this.crypto.getAuthSecret();
+    } else {
+      const gen = await this.crypto.generateKey();
+      saltHex = gen.saltHex;
+      fragment = gen.fragment;
+      authSecret = gen.authSecret;
+    }
 
     // 2. Initialize chunker
     const source: ChunkSource =

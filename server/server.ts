@@ -11,6 +11,7 @@ import fastifyStatic from '@fastify/static';
 import middie from '@fastify/middie';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { RelayChunkStore } from './relay-store.js';
 import { SignalingHub } from './signaling.js';
@@ -101,6 +102,9 @@ async function start() {
     const assignedPeerId = peerId || Math.random().toString(36).substring(2, 9);
     const roomId = signalingHub.createRoom(authSecret);
     signalingHub.joinRoom(roomId, assignedPeerId, req.ip, undefined, authSecret);
+    if (authSecret) {
+      await chunkStore.registerSession(roomId, authSecret);
+    }
     return { roomId, peerId: assignedPeerId };
   });
 
@@ -115,6 +119,36 @@ async function start() {
       return reply.status(403).send({ error: result.error });
     }
     return { roomId, peerId: assignedPeerId, ...result };
+  });
+
+  app.post('/api/signaling/signal', async (req, reply) => {
+    const { roomId, fromPeerId, payload } = (req.body as any) || {};
+    if (!roomId || !fromPeerId) {
+      return reply.status(400).send({ error: 'roomId and fromPeerId required' });
+    }
+    signalingHub.broadcastToRoom(roomId, fromPeerId, {
+      type: 'signal',
+      fromPeerId,
+      payload,
+    });
+    return { success: true };
+  });
+
+  app.get('/api/signaling/poll', async (req, reply) => {
+    const { roomId, peerId } = req.query as { roomId: string; peerId: string };
+    if (!roomId || !peerId) {
+      return reply.status(400).send({ error: 'roomId and peerId required' });
+    }
+    const messages = signalingHub.pollMessages(roomId, peerId);
+    return { messages };
+  });
+
+  app.post('/api/signaling/leave', async (req) => {
+    const { roomId, peerId } = (req.body as any) || {};
+    if (roomId && peerId) {
+      signalingHub.leaveRoom(roomId, peerId);
+    }
+    return { success: true };
   });
 
   // Zero-Knowledge Encrypted Chunk Relay Endpoints (Streaming I/O directly to disk)
@@ -210,20 +244,21 @@ async function start() {
     return reply.status(200).send({ success });
   });
 
-  // WebSocket Signaling Connection
-  app.get('/ws/signaling', { websocket: true }, (socket, req) => {
+  // WebSocket Signaling Connection Handler
+  const handleWsConnection = (socket: any, req: any) => {
     let currentRoomId: string | null = null;
     let currentPeerId: string | null = null;
-    const clientIp = req.socket.remoteAddress || req.ip || 'unknown';
+    const clientIp = req.socket?.remoteAddress || req.ip || 'unknown';
 
-    socket.on('message', (data: Buffer | string) => {
+    socket.on('message', async (data: Buffer | string) => {
       try {
         const msg = JSON.parse(data.toString());
         const { type, roomId, peerId, payload, authSecret } = msg;
 
         switch (type) {
           case 'create_room': {
-            const assignedRoomId = roomId || signalingHub.createRoom(authSecret);
+            const requestedCode = roomId || payload?.code;
+            const assignedRoomId = requestedCode || signalingHub.createRoom(authSecret);
             currentRoomId = assignedRoomId;
             currentPeerId = peerId || Math.random().toString(36).substring(2, 9);
             const { isInitiator, isLanPeer } = signalingHub.joinRoom(
@@ -233,6 +268,12 @@ async function start() {
               socket,
               authSecret
             );
+
+            if (authSecret) {
+              await chunkStore.registerSession(assignedRoomId, authSecret).catch((e) => {
+                console.warn('Failed to register relay session:', e);
+              });
+            }
 
             socket.send(
               JSON.stringify({
@@ -309,7 +350,10 @@ async function start() {
         signalingHub.leaveRoom(currentRoomId, currentPeerId);
       }
     });
-  });
+  };
+
+  app.get('/ws', { websocket: true }, handleWsConnection);
+  app.get('/ws/signaling', { websocket: true }, handleWsConnection);
 
   // Production static file serving or development Vite integration
   if (isProduction) {
@@ -326,9 +370,31 @@ async function start() {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa',
+      appType: 'custom',
     });
-    app.use(vite.middlewares);
+    app.use((req: any, _res: any, next: any) => {
+      const url = req.url || '';
+      if (url.startsWith('/api') || url.startsWith('/ws')) {
+        return next();
+      }
+      vite.middlewares(req, _res, next);
+    });
+
+    app.setNotFoundHandler(async (req, reply) => {
+      const url = req.raw.url || '';
+      if (url.startsWith('/api') || url.startsWith('/ws')) {
+        return reply.status(404).send({ error: 'Not found' });
+      }
+      try {
+        const indexPath = path.resolve(__dirname, '../index.html');
+        const rawHtml = fs.readFileSync(indexPath, 'utf-8');
+        const transformedHtml = await vite.transformIndexHtml(url, rawHtml);
+        reply.type('text/html').send(transformedHtml);
+      } catch (err: any) {
+        vite.ssrFixStacktrace(err);
+        reply.status(500).send(err.message);
+      }
+    });
   }
 
   await app.listen({ port: PORT, host: '0.0.0.0' });

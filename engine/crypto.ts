@@ -175,6 +175,15 @@ export class TransferCrypto {
     return this.authSecret;
   }
 
+  public getSaltHex(): string {
+    return this.toHex(this.salt);
+  }
+
+  public getFragment(): string {
+    if (!this.masterKeyRaw) return '';
+    return `${this.toHex(this.masterKeyRaw)}.${this.toHex(this.salt)}`;
+  }
+
   public isReady(): boolean {
     return this.chunkKey !== null;
   }
@@ -279,10 +288,6 @@ export class TransferCrypto {
 
     const dec = new TextDecoder();
     return dec.decode(plaintextBuffer);
-  }
-
-  public getSaltHex(): string {
-    return this.toHex(this.salt);
   }
 
   private toHex(bytes: Uint8Array): string {

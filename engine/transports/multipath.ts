@@ -55,6 +55,11 @@ export class MultipathController {
     this.scheduler.pause();
   }
 
+  public stop(): void {
+    this.isRunning = false;
+    this.scheduler.pause();
+  }
+
   public resume(): void {
     this.isRunning = true;
     this.scheduler.resume();
