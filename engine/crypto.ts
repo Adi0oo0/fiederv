@@ -179,6 +179,14 @@ export class TransferCrypto {
     return this.toHex(this.salt);
   }
 
+  public getMasterKeyRaw(): Uint8Array | null {
+    return this.masterKeyRaw;
+  }
+
+  public getSalt(): Uint8Array {
+    return this.salt;
+  }
+
   public getFragment(): string {
     if (!this.masterKeyRaw) return '';
     return `${this.toHex(this.masterKeyRaw)}.${this.toHex(this.salt)}`;

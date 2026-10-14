@@ -249,35 +249,6 @@ export function TransferProgress({
     }
   }, [effectiveSpeedMBps, remainingBytes, progress?.status, progress?.etaSeconds]);
 
-  const formattedTimeRemaining = useMemo(() => {
-    if (!progress) return '—';
-    if (progress.status === 'completed') return '0s';
-    if (progress.status === 'verifying') return 'Verifying...';
-    if (progress.status === 'preparing') return 'Connecting...';
-
-    if (smoothedEtaSeconds === null) {
-      return progress.etaSeconds ? `${progress.etaSeconds}s` : 'Estimating...';
-    }
-
-    if (smoothedEtaSeconds <= 0) {
-      return remainingBytes === 0 ? '0s' : '< 1s';
-    }
-
-    if (smoothedEtaSeconds < 60) {
-      return `${smoothedEtaSeconds}s`;
-    }
-
-    const mins = Math.floor(smoothedEtaSeconds / 60);
-    const secs = smoothedEtaSeconds % 60;
-    if (mins < 60) {
-      return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
-    }
-
-    const hrs = Math.floor(mins / 60);
-    const remMins = mins % 60;
-    return remMins > 0 ? `${hrs}h ${remMins}m` : `${hrs}h`;
-  }, [progress, smoothedEtaSeconds, remainingBytes]);
-
   const estimatedCompletionClock = useMemo(() => {
     if (!progress || progress.status !== 'transferring' || smoothedEtaSeconds === null || smoothedEtaSeconds <= 0) {
       return null;
@@ -285,6 +256,37 @@ export function TransferProgress({
     const completionDate = new Date(Date.now() + smoothedEtaSeconds * 1000);
     return completionDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }, [progress?.status, smoothedEtaSeconds]);
+
+  const timeDisplay = useMemo(() => {
+    if (!progress) return { main: '—', sub: 'Idle' };
+    if (progress.status === 'completed') return { main: '0s', sub: 'Complete' };
+    if (progress.status === 'verifying') return { main: '—', sub: 'Verifying...' };
+    if (progress.status === 'preparing') return { main: '—', sub: 'Connecting...' };
+
+    if (smoothedEtaSeconds === null) {
+      return { main: '~', sub: 'Estimating...' };
+    }
+
+    if (smoothedEtaSeconds <= 0) {
+      return { main: remainingBytes === 0 ? '0s' : '< 1s', sub: 'Finishing...' };
+    }
+
+    const clockSub = estimatedCompletionClock ? `ETA: ${estimatedCompletionClock}` : 'Live estimate';
+
+    if (smoothedEtaSeconds < 60) {
+      return { main: `${smoothedEtaSeconds}s`, sub: clockSub };
+    }
+
+    const mins = Math.floor(smoothedEtaSeconds / 60);
+    const secs = smoothedEtaSeconds % 60;
+    if (mins < 60) {
+      return { main: secs > 0 ? `${mins}m ${secs}s` : `${mins}m`, sub: clockSub };
+    }
+
+    const hrs = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return { main: remMins > 0 ? `${hrs}h ${remMins}m` : `${hrs}h`, sub: clockSub };
+  }, [progress, smoothedEtaSeconds, remainingBytes, estimatedCompletionClock]);
 
   const isCurrentlyCongested = useMemo(() => {
     return totalBufferedAmount > 256 * 1024 || (progress?.status === 'transferring' && effectiveSpeedMBps < 0.4);
@@ -342,20 +344,20 @@ export function TransferProgress({
     <div className="w-full max-w-xl mx-auto bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 sm:p-6 shadow-sm transition-all duration-200">
       {/* Top Bar: Direction, File Info & Clean Action Buttons */}
       <div className="flex items-start justify-between gap-3 pb-3 border-b border-neutral-100 dark:border-neutral-800/80">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 text-[11px] font-mono text-neutral-400 uppercase tracking-wider mb-0.5">
+        <div className="min-w-0 flex-1 overflow-hidden">
+          <div className="flex items-center gap-1.5 text-[11px] font-mono text-neutral-400 uppercase tracking-wider mb-0.5 truncate">
             {isReceiving ? (
-              <ArrowDownLeft className="w-3.5 h-3.5 text-emerald-500" />
+              <ArrowDownLeft className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
             ) : (
-              <ArrowUpRight className="w-3.5 h-3.5 text-neutral-900 dark:text-neutral-100" />
+              <ArrowUpRight className="w-3.5 h-3.5 text-neutral-900 dark:text-neutral-100 shrink-0" />
             )}
-            <span>{isReceiving ? 'Receiving File' : 'Sending File'}</span>
+            <span className="truncate">{isReceiving ? 'Receiving File' : 'Sending File'}</span>
             {progress.totalBytes > 0 && (
-              <span className="text-neutral-500 font-sans">· {formatBytes(progress.totalBytes)}</span>
+              <span className="text-neutral-500 font-sans truncate">· {formatBytes(progress.totalBytes)}</span>
             )}
           </div>
           <h3
-            className="text-sm sm:text-base font-bold text-neutral-900 dark:text-neutral-100 truncate font-mono tracking-tight"
+            className="text-xs sm:text-sm font-bold text-neutral-900 dark:text-neutral-100 truncate font-mono tracking-tight"
             title={fileName || 'File'}
           >
             {fileName || 'Transferring Data...'}
@@ -406,16 +408,16 @@ export function TransferProgress({
 
       {/* Main Progress Bar & Percentage Hero */}
       <div className="py-4">
-        <div className="flex items-baseline justify-between mb-2">
-          <div className="flex items-baseline gap-2">
-            <span className="text-3xl sm:text-4xl font-mono font-bold tracking-tight text-neutral-950 dark:text-neutral-50 tabular-nums">
+        <div className="flex items-baseline justify-between mb-2 gap-2 min-w-0">
+          <div className="flex items-baseline gap-2 min-w-0 overflow-hidden">
+            <span className="text-2xl sm:text-3xl font-mono font-bold tracking-tight text-neutral-950 dark:text-neutral-50 tabular-nums shrink-0">
               {percent}%
             </span>
-            <span className={`text-[11px] font-mono px-2 py-0.5 rounded-md border ${streamHealth.badgeClass}`}>
+            <span className={`text-[10px] sm:text-[11px] font-mono px-2 py-0.5 rounded-md border truncate max-w-[120px] sm:max-w-none shrink ${streamHealth.badgeClass}`}>
               {isPaused ? 'Paused' : streamHealth.label}
             </span>
           </div>
-          <div className="text-xs font-mono text-neutral-400 tabular-nums text-right">
+          <div className="text-[11px] sm:text-xs font-mono text-neutral-400 tabular-nums text-right truncate shrink-0">
             <span>{formatBytes(progress.bytesTransferred)}</span>
             <span className="text-neutral-500"> / </span>
             <span>{formatBytes(progress.totalBytes)}</span>
@@ -440,48 +442,48 @@ export function TransferProgress({
       {/* Primary 3-Metric Clean Grid (Speed, Transferred, ETA) */}
       <div className="grid grid-cols-3 gap-2 sm:gap-4 py-3 border-y border-neutral-100 dark:border-neutral-800/80 text-center font-mono">
         {/* Metric 1: Transfer Speed */}
-        <div className="flex flex-col justify-center px-1">
-          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium">
+        <div className="flex flex-col justify-center px-1 min-w-0 overflow-hidden">
+          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium truncate">
             Speed
           </span>
-          <div className="mt-1 flex items-baseline justify-center gap-0.5">
-            <span className="text-lg sm:text-2xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums">
+          <div className="mt-1 flex items-baseline justify-center gap-0.5 min-w-0 overflow-hidden">
+            <span className="text-base sm:text-xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums truncate">
               {apparentSpeedMBps.toFixed(1)}
             </span>
-            <span className="text-[10px] sm:text-xs font-semibold text-neutral-400">MB/s</span>
+            <span className="text-[10px] sm:text-xs font-semibold text-neutral-400 shrink-0">MB/s</span>
           </div>
-          <span className="text-[10px] text-neutral-400 truncate">
+          <span className="text-[10px] text-neutral-400 truncate block w-full">
             {compressionRatio > 1.05 ? `${compressionRatio}x boost` : `${apparentMbps} Mbps`}
           </span>
         </div>
 
         {/* Metric 2: Progress Ratio */}
-        <div className="flex flex-col justify-center px-1 border-x border-neutral-100 dark:border-neutral-800/80">
-          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium">
+        <div className="flex flex-col justify-center px-1 border-x border-neutral-100 dark:border-neutral-800/80 min-w-0 overflow-hidden">
+          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium truncate">
             Remaining
           </span>
-          <div className="mt-1 flex items-baseline justify-center gap-0.5">
-            <span className="text-lg sm:text-2xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums">
+          <div className="mt-1 flex items-baseline justify-center gap-0.5 min-w-0 overflow-hidden">
+            <span className="text-base sm:text-xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums truncate">
               {formatBytes(remainingBytes)}
             </span>
           </div>
-          <span className="text-[10px] text-neutral-400 truncate">
+          <span className="text-[10px] text-neutral-400 truncate block w-full">
             {progress.totalChunks > 0 ? `${progress.chunksCompleted || 0}/${progress.totalChunks} chunks` : 'Direct stream'}
           </span>
         </div>
 
         {/* Metric 3: Time Remaining */}
-        <div className="flex flex-col justify-center px-1">
-          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium">
+        <div className="flex flex-col justify-center px-1 min-w-0 overflow-hidden">
+          <span className="text-[10px] sm:text-[11px] uppercase tracking-wider text-neutral-400 font-sans font-medium truncate">
             Time Left
           </span>
-          <div className="mt-1 flex items-baseline justify-center gap-0.5">
-            <span className="text-lg sm:text-2xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums">
-              {formattedTimeRemaining}
+          <div className="mt-1 flex items-baseline justify-center gap-0.5 min-w-0 overflow-hidden">
+            <span className="text-base sm:text-xl font-bold text-neutral-950 dark:text-neutral-50 tabular-nums truncate">
+              {timeDisplay.main}
             </span>
           </div>
-          <span className="text-[10px] text-neutral-400 truncate">
-            {estimatedCompletionClock ? `ETA: ${estimatedCompletionClock}` : 'Live estimate'}
+          <span className="text-[10px] text-neutral-400 truncate block w-full" title={timeDisplay.sub}>
+            {timeDisplay.sub}
           </span>
         </div>
       </div>

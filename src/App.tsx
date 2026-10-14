@@ -621,12 +621,12 @@ export default function App() {
             {mode === 'receive' && (
               <div className="w-full max-w-xl mx-auto my-6">
                 {incomingManifest ? (
-                  <div className="border border-neutral-200 dark:border-neutral-800 rounded-2xl p-8 bg-white dark:bg-neutral-900 text-center space-y-6">
-                    <div>
-                      <h3 className="text-lg font-bold text-neutral-900 dark:text-neutral-100 tracking-tight">
+                  <div className="border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-8 bg-white dark:bg-neutral-900 text-center space-y-6">
+                    <div className="min-w-0 overflow-hidden">
+                      <h3 className="text-base sm:text-lg font-bold text-neutral-900 dark:text-neutral-100 tracking-tight truncate max-w-md mx-auto" title={incomingManifest.name}>
                         {incomingManifest.name}
                       </h3>
-                      <p className="text-xs font-mono text-neutral-500 mt-1">
+                      <p className="text-xs font-mono text-neutral-500 mt-1 truncate">
                         {formatBytes(incomingManifest.size)} · {incomingManifest.totalChunks} chunks
                       </p>
                     </div>

@@ -22,6 +22,8 @@ import { FrameCodec, FrameType } from './transports/types.js';
 import { MultipathController } from './transports/multipath.js';
 import { WebRTCPeerManager } from './transports/webrtc.js';
 import { HttpRelayTransport } from './transports/http-relay.js';
+import { TransferPipeline } from './pipeline.js';
+import { getFileCompressionCategory, FileTypeCategory } from '../src/lib/compression.js';
 
 export interface TransferEngineEvents {
   onStateChange?: (state: TransferState) => void;
@@ -41,6 +43,7 @@ export class TransferEngine {
 
   // Subsystems
   public crypto: TransferCrypto = new TransferCrypto();
+  private pipeline: TransferPipeline = new TransferPipeline();
   private chunker: FileChunker | null = null;
   private diskWriter: IDiskWriter | null = null;
   private scheduler: WorkStealingScheduler | null = null;
@@ -124,6 +127,17 @@ export class TransferEngine {
     // 3. Create instant manifest without 100 GB pre-read delay
     this.manifest = this.chunker.createInstantManifest(sessionId, saltHex);
 
+    // Initialize Multithreaded Processing Pipeline with master keys & compression candidate check
+    const cat = getFileCompressionCategory(this.manifest.name, this.manifest.mimeType);
+    const isCompressible = cat !== FileTypeCategory.PRE_COMPRESSED;
+    if (this.crypto.getMasterKeyRaw()) {
+      await this.pipeline.initKeys(
+        this.crypto.getMasterKeyRaw()!,
+        this.crypto.getSalt(),
+        isCompressible
+      );
+    }
+
     // 4. Initialize Scheduler & Multipath
     this.scheduler = new WorkStealingScheduler(this.manifest.totalChunks);
     if (!this.multipath) {
@@ -173,6 +187,15 @@ export class TransferEngine {
 
     // 1. Initialize Crypto from key fragment
     await this.crypto.initFromFragment(keyFragment);
+
+    // Initialize Multithreaded Processing Pipeline on receiver
+    if (this.crypto.getMasterKeyRaw()) {
+      await this.pipeline.initKeys(
+        this.crypto.getMasterKeyRaw()!,
+        this.crypto.getSalt(),
+        false
+      );
+    }
 
     // 2. Open Disk Writer (preallocates space directly on disk, no RAM buffering)
     await this.diskWriter.open(manifest.name, manifest.size);
@@ -235,16 +258,13 @@ export class TransferEngine {
 
     this.multipath.onChunkReadyToSend = async (chunkIndex, transport) => {
       try {
-        const plaintext = await this.chunker!.readChunk(chunkIndex);
-        // Compute leaf hash on the fly during transmission
-        const leafHash = await Hasher.hashChunk(plaintext);
-        this.verifiedLeaves[chunkIndex] = leafHash;
+        const rawBytes = await this.chunker!.readChunk(chunkIndex);
+        // Offload compression + encryption + leaf hashing to background worker threads
+        const processed = await this.pipeline.processOutgoingChunk(chunkIndex, rawBytes);
+        this.verifiedLeaves[chunkIndex] = processed.leafHash;
 
-        // Authenticated AES-256-GCM encryption
-        const ciphertext = await this.crypto.encryptChunk(chunkIndex, plaintext);
         const nonce = this.crypto.constructNonce(chunkIndex);
-
-        // Frame without plaintext hash
+        const ciphertext = new Uint8Array(processed.ciphertextBuffer);
         const frame = FrameCodec.encodeDataFrame(chunkIndex, nonce, ciphertext);
         const sent = await transport.sendFrame(frame);
         return sent;
@@ -399,17 +419,16 @@ export class TransferEngine {
     if (this.scheduler.completedBitmap.has(chunkIdx)) return;
 
     try {
-      // 1. Authenticated AES-256-GCM decryption
-      const plaintext = await this.crypto.decryptChunk(chunkIdx, frame.payload);
+      // Offload decryption + decompression + leaf hashing to background worker threads
+      const processed = await this.pipeline.processIncomingChunk(chunkIdx, frame.payload);
+      const plaintext = new Uint8Array(processed.plaintextBuffer);
+      const computedHash = processed.leafHash;
 
-      // 2. Compute leaf hash for final Merkle tree verification
-      const computedHash = await Hasher.hashChunk(plaintext);
-
-      // 3. Write chunk directly to disk at byte offset without memory accumulation
+      // Write chunk directly to disk at byte offset without memory accumulation
       const offset = chunkIdx * this.manifest.chunkSize;
       await this.diskWriter.writeChunk(offset, plaintext);
 
-      // 4. Record verified leaf hash & update scheduler
+      // Record verified leaf hash & update scheduler
       this.verifiedLeaves[chunkIdx] = computedHash;
       this.bytesTransferred += plaintext.length;
       this.scheduler.onChunkAck(chunkIdx, plaintext.length);
@@ -614,6 +633,8 @@ export class TransferEngine {
     this.stopProgressTicker();
     this.releaseWakeLock();
     this.multipath?.stop();
+    this.pipeline.destroy();
+    this.pipeline = new TransferPipeline();
     await this.webrtc?.close();
     await this.diskWriter?.abort();
     this.setState('idle');

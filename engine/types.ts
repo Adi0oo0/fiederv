@@ -10,6 +10,7 @@ export interface TransferManifest {
   chunkSize: number;
   totalChunks: number;
   merkleRoot: string;
+  mimeType?: string;
   salt?: string; // 8-char hex (4 bytes) for AES-GCM nonce salt
   saltHex?: string;
   createdAt?: number;
