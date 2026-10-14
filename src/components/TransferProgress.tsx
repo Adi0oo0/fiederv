@@ -3,18 +3,12 @@ import { TransferProgress as TransferProgressType, ChannelStat } from '../types/
 import { formatBytes } from '../lib/format';
 import { sound } from '../lib/sound';
 import {
-  Zap,
-  ShieldCheck,
   X,
-  Activity,
   Volume2,
   VolumeX,
   Gauge,
   Play,
   Pause,
-  ChevronDown,
-  ChevronUp,
-  Clock,
   TrendingDown,
   ArrowUpRight,
   ArrowDownLeft,
@@ -61,7 +55,6 @@ export function TransferProgress({
   const [peakSpeedMBps, setPeakSpeedMBps] = useState<number>(0);
   const [smoothedEtaSeconds, setSmoothedEtaSeconds] = useState<number | null>(null);
   const [isAudioMuted, setIsAudioMuted] = useState<boolean>(() => sound.getMuted());
-  const [showDetails, setShowDetails] = useState<boolean>(false);
 
   // Rolling throughput history for the mini oscilloscope
   const [throughputHistory, setThroughputHistory] = useState<ThroughputPoint[]>(() => {
@@ -194,7 +187,7 @@ export function TransferProgress({
   }, [progress?.totalBytes, progress?.bytesTransferred]);
 
   useEffect(() => {
-    if (!progress || progress.status !== 'transferring' || !showDetails) return;
+    if (!progress || progress.status !== 'transferring') return;
 
     const interval = setInterval(() => {
       const now = Date.now();
@@ -222,7 +215,7 @@ export function TransferProgress({
     }, 400);
 
     return () => clearInterval(interval);
-  }, [progress, apparentSpeedMBps, physicalSpeedMBps, totalBufferedAmount, showDetails]);
+  }, [progress, apparentSpeedMBps, physicalSpeedMBps, totalBufferedAmount]);
 
   useEffect(() => {
     if (!progress) {
@@ -493,123 +486,74 @@ export function TransferProgress({
         </div>
       </div>
 
-      {/* Expandable Technical Details / Live Oscilloscope Drawer */}
+      {/* Direct Realtime Throughput Graph */}
       <div className="pt-3">
-        <div className="flex items-center justify-between text-xs font-mono">
-          <div className="flex items-center gap-1.5 text-neutral-400 text-[11px]">
-            <ShieldCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-            <span>DTLS 1.3 · E2EE Authenticated</span>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setShowDetails(!showDetails)}
-            className="inline-flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 py-1 px-2 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors cursor-pointer"
-            aria-expanded={showDetails}
-          >
-            <Activity className="w-3.5 h-3.5 text-neutral-400" />
-            <span>{showDetails ? 'Hide Stats' : 'Diagnostics'}</span>
-            {showDetails ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-          </button>
+        <div className="flex items-center justify-between text-[11px] font-mono text-neutral-400 mb-2">
+          <span className="flex items-center gap-1 font-semibold uppercase tracking-wider text-neutral-500 dark:text-neutral-400">
+            <Gauge className="w-3.5 h-3.5 text-neutral-700 dark:text-neutral-300" />
+            Realtime Speed
+          </span>
+          <span className="flex items-center gap-2">
+            <span>Peak: {peakSpeedMBps.toFixed(1)} MB/s</span>
+            {isCurrentlyCongested && (
+              <span className="text-amber-500 font-semibold flex items-center gap-0.5">
+                <TrendingDown className="w-3 h-3" /> Pacing
+              </span>
+            )}
+          </span>
         </div>
 
-        {/* Collapsible Section: Oscilloscope Chart & SCTP Channel Badges */}
-        {showDetails && (
-          <div className="mt-3 pt-3 border-t border-neutral-100 dark:border-neutral-800 space-y-3 animate-in fade-in duration-200">
-            {/* Mini Chart */}
-            <div className="p-3 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-neutral-50/60 dark:bg-neutral-950/40">
-              <div className="flex items-center justify-between text-[10px] font-mono text-neutral-400 mb-2">
-                <span className="flex items-center gap-1 font-semibold uppercase">
-                  <Gauge className="w-3 h-3 text-neutral-600 dark:text-neutral-300" />
-                  Throughput Oscilloscope
-                </span>
-                <span className="flex items-center gap-2">
-                  <span>Peak: {peakSpeedMBps.toFixed(1)} MB/s</span>
-                  {isCurrentlyCongested && (
-                    <span className="text-amber-500 font-semibold flex items-center gap-0.5">
-                      <TrendingDown className="w-3 h-3" /> Pacing
-                    </span>
-                  )}
-                </span>
-              </div>
-
-              <div className="h-16 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={throughputHistory} margin={{ top: 2, right: 0, left: -24, bottom: 0 }}>
-                    <defs>
-                      <linearGradient id="speedGradientClean" x1="0" y1="0" x2="0" y2="1">
-                        <stop
-                          offset="5%"
-                          stopColor={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
-                          stopOpacity={0.35}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
-                          stopOpacity={0.0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <XAxis dataKey="time" hide />
-                    <YAxis
-                      domain={[0, (dataMax: number) => Math.max(2, Math.ceil(dataMax * 1.2))]}
-                      axisLine={false}
-                      tickLine={false}
-                      tick={{ fontSize: 9, fill: '#888' }}
-                    />
-                    <ReferenceLine y={0.5} stroke="#f59e0b" strokeDasharray="3 3" strokeOpacity={0.4} />
-                    <Tooltip
-                      content={({ active, payload }) => {
-                        if (active && payload && payload.length) {
-                          const data = payload[0].payload as ThroughputPoint;
-                          return (
-                            <div className="bg-neutral-900 text-white text-[10px] font-mono px-2 py-1 rounded shadow-md border border-neutral-700">
-                              <span className="font-bold text-emerald-400">{data.speedMBps.toFixed(1)} MB/s</span>
-                              <span className="text-neutral-400 text-[9px] block">{data.time}</span>
-                            </div>
-                          );
-                        }
-                        return null;
-                      }}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="speedMBps"
-                      stroke={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
-                      strokeWidth={1.5}
-                      fillOpacity={1}
-                      fill="url(#speedGradientClean)"
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            {/* SCTP Channel Badges */}
-            <div className="flex items-center justify-between text-xs font-mono pt-1">
-              <span className="text-[10px] uppercase text-neutral-400">SCTP Channels:</span>
-              <div className="flex items-center gap-1">
-                {[0, 1, 2, 3].map((chId) => {
-                  const stat = channelStats.find((s) => s.id === chId);
-                  const isWorking = progress.status === 'transferring' && (stat?.bufferedAmount || 0) > 0;
-                  return (
-                    <span
-                      key={chId}
-                      className={`px-1.5 py-0.5 rounded text-[10px] border ${
-                        isWorking
-                          ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-900'
-                          : 'border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-800 text-neutral-400'
-                      }`}
-                    >
-                      CH_{chId}
-                    </span>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        )}
+        <div className="h-28 sm:h-32 w-full p-2.5 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-neutral-50/70 dark:bg-neutral-950/50">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={throughputHistory} margin={{ top: 4, right: 0, left: -24, bottom: 0 }}>
+              <defs>
+                <linearGradient id="speedGradientClean" x1="0" y1="0" x2="0" y2="1">
+                  <stop
+                    offset="5%"
+                    stopColor={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
+                    stopOpacity={0.35}
+                  />
+                  <stop
+                    offset="95%"
+                    stopColor={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
+                    stopOpacity={0.0}
+                  />
+                </linearGradient>
+              </defs>
+              <XAxis dataKey="time" hide />
+              <YAxis
+                domain={[0, (dataMax: number) => Math.max(2, Math.ceil(dataMax * 1.2))]}
+                axisLine={false}
+                tickLine={false}
+                tick={{ fontSize: 9, fill: '#888' }}
+              />
+              <ReferenceLine y={0.5} stroke="#f59e0b" strokeDasharray="3 3" strokeOpacity={0.4} />
+              <Tooltip
+                content={({ active, payload }) => {
+                  if (active && payload && payload.length) {
+                    const data = payload[0].payload as ThroughputPoint;
+                    return (
+                      <div className="bg-neutral-900 text-white text-[10px] font-mono px-2 py-1 rounded shadow-md border border-neutral-700">
+                        <span className="font-bold text-emerald-400">{data.speedMBps.toFixed(1)} MB/s</span>
+                        <span className="text-neutral-400 text-[9px] block">{data.time}</span>
+                      </div>
+                    );
+                  }
+                  return null;
+                }}
+              />
+              <Area
+                type="monotone"
+                dataKey="speedMBps"
+                stroke={isCurrentlyCongested ? '#f59e0b' : '#10b981'}
+                strokeWidth={1.5}
+                fillOpacity={1}
+                fill="url(#speedGradientClean)"
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
       </div>
     </div>
   );

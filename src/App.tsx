@@ -13,7 +13,7 @@ import { TransferManifest, IDiskWriter } from '../engine/types';
 import { ConnectionState, TransferProgress as TransferProgressType, ChannelStat } from './types/transfer';
 import { sound } from './lib/sound';
 import { formatBytes } from './lib/format';
-import { Inbox, CheckCircle2, Download, Pause, Play, X, ShieldCheck } from 'lucide-react';
+import { Inbox, CheckCircle2, Download, Send } from 'lucide-react';
 
 export default function App() {
   const [mode, setMode] = useState<'send' | 'receive'>('send');
@@ -434,6 +434,24 @@ export default function App() {
     handleRegenerateCode();
   };
 
+  const handleSendAgain = () => {
+    setFilesToSend([]);
+    setTransferProgress(null);
+    setIncomingManifest(null);
+    setIsTransferComplete(false);
+    setIsSending(false);
+    setIsReceiving(false);
+    setFinalMerkleRoot('');
+    setFallbackDownloadUrl(null);
+    setErrorMessage(null);
+    setMode('send');
+    engineRef.current?.cancel();
+
+    if (connectionState !== 'connected') {
+      handleRegenerateCode();
+    }
+  };
+
   const handleAddFiles = (newFiles: File[]) => {
     setFilesToSend((prev) => [...prev, ...newFiles]);
   };
@@ -523,6 +541,10 @@ export default function App() {
       ? filesToSend.length > 0 ? filesToSend[0].name : ''
       : incomingManifest?.name || '';
 
+  const isTransferActive =
+    (isSending || isReceiving || (transferProgress && transferProgress.status === 'transferring')) &&
+    !isTransferComplete;
+
   return (
     <div className="min-h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 transition-colors duration-200">
       <Header
@@ -531,57 +553,116 @@ export default function App() {
       />
 
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 py-8 sm:py-12">
-        {/* Monochromatic Title */}
-        <div className="text-center mb-8">
-          <h1 className="text-3xl sm:text-4xl font-display font-bold tracking-tight text-neutral-950 dark:text-neutral-50 uppercase">
-            Drop
-          </h1>
-          <p className="mt-2 text-xs font-mono text-neutral-500 tracking-wider uppercase">
-            Zero-Memory Stream · Authenticated E2EE · Resumable
-          </p>
-        </div>
+        {/* Idle / Pairing / Staging View (Hidden during transfer and after completion) */}
+        {!isTransferActive && !isTransferComplete && (
+          <>
+            {/* Monochromatic Title */}
+            <div className="text-center mb-8">
+              <h1 className="text-3xl sm:text-4xl font-display font-bold tracking-tight text-neutral-950 dark:text-neutral-50 uppercase">
+                Drop
+              </h1>
+              <p className="mt-2 text-xs font-mono text-neutral-500 tracking-wider uppercase">
+                Zero-Memory Stream · Authenticated E2EE · Resumable
+              </p>
+            </div>
 
-        {/* Monochromatic Mode Toggle */}
-        <ModeToggle
-          mode={mode}
-          onChange={handleModeChange}
-          disabled={isSending || isReceiving}
-        />
+            {/* Monochromatic Mode Toggle */}
+            <ModeToggle
+              mode={mode}
+              onChange={handleModeChange}
+              disabled={isSending || isReceiving}
+            />
 
-        {/* Connection & Tunnel Status Banner */}
-        <ConnectionStatusBanner
-          connectionState={connectionState}
-          roomCode={roomCode}
-          peersCount={peersCount}
-          errorMessage={errorMessage}
-          onRetry={() => {
-            setErrorMessage(null);
-            if (mode === 'send') {
-              handleRegenerateCode();
-            } else {
-              setConnectionState('disconnected');
-            }
-          }}
-        />
+            {/* Connection & Tunnel Status Banner */}
+            <ConnectionStatusBanner
+              connectionState={connectionState}
+              roomCode={roomCode}
+              peersCount={peersCount}
+              errorMessage={errorMessage}
+              onRetry={() => {
+                setErrorMessage(null);
+                if (mode === 'send') {
+                  handleRegenerateCode();
+                } else {
+                  setConnectionState('disconnected');
+                }
+              }}
+            />
 
-        {/* Pairing Section */}
-        {connectionState !== 'connected' && !isSending && !isReceiving && (
-          <PairingSection
-            mode={mode}
-            roomCode={roomCode}
-            hostRoomCode={hostRoomCode}
-            initialCode={urlParamCode || undefined}
-            isGeneratingCode={isGeneratingCode}
-            onRegenerateCode={handleRegenerateCode}
-            onJoinCode={handleJoinManualCode}
-            isConnecting={connectionState === 'connecting_peer'}
-            e2eeKey={e2eeKey}
-          />
+            {/* Pairing Section */}
+            {connectionState !== 'connected' && (
+              <PairingSection
+                mode={mode}
+                roomCode={roomCode}
+                hostRoomCode={hostRoomCode}
+                initialCode={urlParamCode || undefined}
+                isGeneratingCode={isGeneratingCode}
+                onRegenerateCode={handleRegenerateCode}
+                onJoinCode={handleJoinManualCode}
+                isConnecting={connectionState === 'connecting_peer'}
+                e2eeKey={e2eeKey}
+              />
+            )}
+
+            {/* Send Mode: Dropzone */}
+            {mode === 'send' && (
+              <FileDropzone
+                files={filesToSend}
+                onAddFiles={handleAddFiles}
+                onRemoveFile={handleRemoveFile}
+                onClearFiles={handleClearFiles}
+                onSend={handleStartSending}
+                isConnected={connectionState === 'connected'}
+                isSending={isSending}
+              />
+            )}
+
+            {/* Receive Mode: Single Download Button streaming directly to disk */}
+            {mode === 'receive' && (
+              <div className="w-full max-w-xl mx-auto my-6">
+                {incomingManifest ? (
+                  <div className="border border-neutral-200 dark:border-neutral-800 rounded-2xl p-8 bg-white dark:bg-neutral-900 text-center space-y-6">
+                    <div>
+                      <h3 className="text-lg font-bold text-neutral-900 dark:text-neutral-100 tracking-tight">
+                        {incomingManifest.name}
+                      </h3>
+                      <p className="text-xs font-mono text-neutral-500 mt-1">
+                        {formatBytes(incomingManifest.size)} · {incomingManifest.totalChunks} chunks
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleStartReceiving}
+                      className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-8 py-3.5 rounded-xl bg-neutral-900 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 font-medium text-sm hover:opacity-90 active:scale-[0.99] transition-all cursor-pointer shadow-sm"
+                    >
+                      <Download className="w-4 h-4 stroke-[2]" />
+                      <span>Download (Stream Directly to Disk)</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="border border-dashed border-neutral-300 dark:border-neutral-800 rounded-3xl p-10 sm:p-14 text-center">
+                    <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center text-neutral-400">
+                      <Inbox className="w-6 h-6 stroke-[1.75]" />
+                    </div>
+                    <h3 className="text-sm font-semibold text-neutral-800 dark:text-neutral-200">
+                      Ready to Receive
+                    </h3>
+                    <p className="text-xs text-neutral-400 mt-1 max-w-xs mx-auto">
+                      {connectionState === 'connected'
+                        ? 'Connected. Waiting for peer to drop files...'
+                        : 'Enter the 6-digit code or open share link.'}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
 
-        {/* Transfer Progress and Metrics */}
-        {(transferProgress || isSending || isReceiving) && (
-          <div className="w-full max-w-xl mx-auto my-6 space-y-3">
+        {/* Active Transfer: User ONLY sees graph and realtime stats */}
+        {isTransferActive && (
+          <div className="w-full max-w-xl mx-auto my-6 sm:my-10 space-y-3">
             <TransferProgress
               progress={transferProgress}
               channelStats={channelStats}
@@ -591,109 +672,59 @@ export default function App() {
               fileName={currentFileName}
               isReceiving={mode === 'receive'}
             />
-
-            {/* Controls are inside TransferProgress component */}
-
-              {/* Small Monospace Root Hash Line */}
-              {finalMerkleRoot && (
-                <div className="flex items-center gap-1.5 text-[11px] truncate max-w-xs text-neutral-400">
-                  <ShieldCheck className="w-3 h-3 text-neutral-400 shrink-0" />
-                  <span className="truncate">Root: {finalMerkleRoot}</span>
-                </div>
-              )}
           </div>
         )}
 
-        {/* Send Mode: Dropzone */}
-        {mode === 'send' && !isSending && !isTransferComplete && (
-          <FileDropzone
-            files={filesToSend}
-            onAddFiles={handleAddFiles}
-            onRemoveFile={handleRemoveFile}
-            onClearFiles={handleClearFiles}
-            onSend={handleStartSending}
-            isConnected={connectionState === 'connected'}
-            isSending={isSending}
-          />
-        )}
+        {/* Completion State: Big "Send Again" button, all other information gets away */}
+        {isTransferComplete && (
+          <div className="w-full max-w-xl mx-auto my-8 sm:my-16 animate-in fade-in zoom-in-95 duration-200">
+            <div className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-3xl p-8 sm:p-12 text-center shadow-sm space-y-6">
+              <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="w-8 h-8 stroke-[2.25]" />
+              </div>
 
-        {/* Receive Mode: Single Download Button streaming directly to disk */}
-        {mode === 'receive' && !isReceiving && !isTransferComplete && (
-          <div className="w-full max-w-xl mx-auto my-6">
-            {incomingManifest ? (
-              <div className="border border-neutral-200 dark:border-neutral-800 rounded-2xl p-8 bg-white dark:bg-neutral-900 text-center space-y-6">
-                <div>
-                  <h3 className="text-lg font-bold text-neutral-900 dark:text-neutral-100 tracking-tight">
-                    {incomingManifest.name}
-                  </h3>
-                  <p className="text-xs font-mono text-neutral-500 mt-1">
-                    {formatBytes(incomingManifest.size)} · {incomingManifest.totalChunks} chunks
-                  </p>
+              <div>
+                <h2 className="text-2xl sm:text-3xl font-bold font-display tracking-tight text-neutral-950 dark:text-neutral-50">
+                  Transfer Complete
+                </h2>
+                <p className="text-sm font-mono text-neutral-500 mt-2 truncate max-w-md mx-auto">
+                  {currentFileName ? `${currentFileName} · ` : ''}
+                  {transferProgress?.totalBytes ? formatBytes(transferProgress.totalBytes) : '100% Bit-Verified'}
+                </p>
+              </div>
+
+              {fallbackDownloadUrl && (
+                <div className="pt-2">
+                  <a
+                    href={fallbackDownloadUrl}
+                    download={incomingManifest?.name || 'download.bin'}
+                    className="w-full inline-flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-2xl bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 font-medium text-sm hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-colors"
+                  >
+                    <Download className="w-4 h-4 stroke-[2]" />
+                    <span>Save Downloaded File</span>
+                  </a>
                 </div>
+              )}
+
+              {/* BIG "Send Again" Button */}
+              <div className="pt-4 space-y-3">
+                <button
+                  type="button"
+                  onClick={handleSendAgain}
+                  className="w-full py-4 sm:py-5 px-8 text-base sm:text-lg font-bold rounded-2xl bg-neutral-950 text-white dark:bg-white dark:text-neutral-950 hover:bg-neutral-800 dark:hover:bg-neutral-200 active:scale-[0.99] transition-all cursor-pointer shadow-lg flex items-center justify-center gap-3"
+                >
+                  <Send className="w-5 h-5 sm:w-6 sm:h-6" />
+                  <span>Send Again</span>
+                </button>
 
                 <button
                   type="button"
-                  onClick={handleStartReceiving}
-                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-8 py-3.5 rounded-xl bg-neutral-900 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 font-medium text-sm hover:opacity-90 active:scale-[0.99] transition-all cursor-pointer shadow-sm"
+                  onClick={handleResetSession}
+                  className="text-xs font-mono text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors cursor-pointer"
                 >
-                  <Download className="w-4 h-4 stroke-[2]" />
-                  <span>Download (Stream Directly to Disk)</span>
+                  Start fresh room with new code
                 </button>
               </div>
-            ) : (
-              <div className="border border-dashed border-neutral-300 dark:border-neutral-800 rounded-3xl p-10 sm:p-14 text-center">
-                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center text-neutral-400">
-                  <Inbox className="w-6 h-6 stroke-[1.75]" />
-                </div>
-                <h3 className="text-sm font-semibold text-neutral-800 dark:text-neutral-200">
-                  Ready to Receive
-                </h3>
-                <p className="text-xs text-neutral-400 mt-1 max-w-xs mx-auto">
-                  {connectionState === 'connected'
-                    ? 'Connected. Waiting for peer to drop files...'
-                    : 'Enter the 6-digit code or open share link.'}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Completion Success Notification */}
-        {isTransferComplete && (
-          <div className="w-full max-w-2xl mx-auto my-6 p-6 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 space-y-4">
-            <div className="flex items-center gap-2.5 text-neutral-900 dark:text-neutral-100 font-semibold text-sm">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-              <span>Transfer Complete · 100% Bit-Verified</span>
-            </div>
-
-            {finalMerkleRoot && (
-              <div className="p-3 rounded-lg bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-xs font-mono text-neutral-600 dark:text-neutral-400 break-all">
-                <span className="text-neutral-400 select-none">Merkle Root: </span>
-                {finalMerkleRoot}
-              </div>
-            )}
-
-            {fallbackDownloadUrl && (
-              <div className="pt-2">
-                <a
-                  href={fallbackDownloadUrl}
-                  download={incomingManifest?.name || 'download.bin'}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-neutral-900 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 text-xs font-medium hover:opacity-90 transition-opacity"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Save Downloaded File</span>
-                </a>
-              </div>
-            )}
-
-            <div className="pt-2 flex justify-end">
-              <button
-                type="button"
-                onClick={handleResetSession}
-                className="text-xs font-mono underline text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 cursor-pointer"
-              >
-                Start New Transfer
-              </button>
             </div>
           </div>
         )}
