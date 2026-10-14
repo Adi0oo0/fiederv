@@ -1,9 +1,10 @@
 import { FileMetadata, TransferProgress, ReceivedFileItem, ConnectionState, ChannelStat } from '../types/transfer';
 import { computeBlobCRC32 } from './crc32';
-import { isCompressibleFast, compressBlock, decompressBlock } from './compression';
+import { isCompressibleFast, compressBlock, decompressBlock, getFileCompressionCategory, getOptimalChunkSize } from './compression';
+import { E2EESession } from './crypto';
 
-// 64 KB chunk size for optimal WebRTC MTU
-export const CHUNK_SIZE = 64 * 1024;
+// Default base chunk size for optimal WebRTC MTU
+export const DEFAULT_CHUNK_SIZE = 64 * 1024;
 // Dynamic BDP Buffer thresholds: 512 KB min, 4 MB max based on throughput
 export const MIN_BUFFER_THRESHOLD = 512 * 1024;
 export const MAX_BUFFER_THRESHOLD = 4 * 1024 * 1024;
@@ -12,12 +13,15 @@ export const BUFFER_LOW_THRESHOLD = 128 * 1024;
 export const NUM_DATA_CHANNELS = 4;
 
 // Binary Frame Header Size: 16 bytes
-// [0..3] Uint32: File Sequence Index (Bit 31: 1 = compressed block, 0 = raw block)
+// [0..3] Uint32: File Sequence Index
+//   Bit 31 (0x80000000): Compressed block flag
+//   Bit 30 (0x40000000): End-to-End Encrypted (AES-256-GCM) block flag
 // [4..7] Uint32: Chunk Index
 // [8..11] Uint32: Total Chunks
 // [12..15] Uint32: Payload Length
 const HEADER_SIZE = 16;
 const FLAG_COMPRESSED = 0x80000000;
+const FLAG_ENCRYPTED = 0x40000000;
 
 export interface WebRTCCallbacks {
   onConnectionStateChange: (state: ConnectionState) => void;
@@ -64,9 +68,16 @@ export class P2PTransferEngine {
   private totalBytesToTransfer = 0;
   private totalBytesTransferred = 0; // Apparent bytes
   private totalPhysicalBytesTransferred = 0; // Physical wire bytes
+  public e2ee: E2EESession = new E2EESession();
 
   constructor(callbacks: WebRTCCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public async setE2EEKey(keyFragment: string): Promise<void> {
+    if (keyFragment) {
+      await this.e2ee.initFromFragment(keyFragment);
+    }
   }
 
   private closePeerConnection() {
@@ -380,7 +391,8 @@ export class P2PTransferEngine {
     if (buffer.byteLength < HEADER_SIZE + payloadLength) return;
 
     const isChunkCompressed = (rawFileIndex & FLAG_COMPRESSED) !== 0;
-    const fileIndex = (rawFileIndex & ~FLAG_COMPRESSED) >>> 0;
+    const isChunkEncrypted = (rawFileIndex & FLAG_ENCRYPTED) !== 0;
+    const fileIndex = (rawFileIndex & ~(FLAG_COMPRESSED | FLAG_ENCRYPTED)) >>> 0;
 
     const fileRecord = this.incomingFiles.get(fileIndex);
     if (!fileRecord || fileRecord.finalized) return;
@@ -390,8 +402,23 @@ export class P2PTransferEngine {
     // Prevent duplicate processing
     if (fileRecord.chunks[chunkIndex]) return;
 
-    const payload = new Uint8Array(buffer, HEADER_SIZE, payloadLength);
+    let payload = new Uint8Array(buffer, HEADER_SIZE, payloadLength);
 
+    // 1. Decrypt chunk if encrypted with E2EE AES-256-GCM
+    if (isChunkEncrypted) {
+      if (!this.e2ee.isReady()) {
+        console.error(`Received encrypted chunk for file ${fileIndex} but E2EE key is not set.`);
+        return;
+      }
+      try {
+        payload = await this.e2ee.decryptChunk(chunkIndex, payload);
+      } catch (err) {
+        console.error(`E2EE decryption authentication failed for file ${fileIndex} chunk ${chunkIndex}:`, err);
+        return;
+      }
+    }
+
+    // 2. Decompress chunk if compressed
     let rawBuffer: ArrayBuffer;
     if (isChunkCompressed) {
       try {
@@ -404,7 +431,9 @@ export class P2PTransferEngine {
         return;
       }
     } else {
-      rawBuffer = buffer.slice(HEADER_SIZE, HEADER_SIZE + payloadLength);
+      const copy = new Uint8Array(payload.byteLength);
+      copy.set(payload);
+      rawBuffer = copy.buffer;
     }
 
     fileRecord.chunks[chunkIndex] = rawBuffer;
@@ -604,7 +633,7 @@ export class P2PTransferEngine {
 
     // 1. Prepare manifest & fast compressibility assessment without whole-file memory buffering
     const manifest: FileMetadata[] = [];
-    const isCompMap = new Map<number, boolean>();
+    const compSettingsMap = new Map<number, { isComp: boolean; chunkSize: number; expectedRatio: number }>();
 
     for (let idx = 0; idx < files.length; idx++) {
       const file = files[idx];
@@ -612,11 +641,12 @@ export class P2PTransferEngine {
       // Streaming CRC32 calculation in 2MB slices - NO whole-file ArrayBuffer buffering!
       const crc = await computeBlobCRC32(file);
 
-      // Fast entropy + extension compressibility check in < 2ms
-      const isComp = await isCompressibleFast(file);
-      isCompMap.set(idx, isComp);
+      // Fast type-specific entropy + extension assessment
+      const compEval = await isCompressibleFast(file);
+      const chunkSize = getOptimalChunkSize(compEval.category);
+      compSettingsMap.set(idx, { isComp: compEval.isCompressible, chunkSize, expectedRatio: compEval.expectedRatio });
 
-      const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
+      const totalChunks = Math.ceil(file.size / chunkSize) || 1;
 
       manifest.push({
         id: `${idx}_${file.name}_${file.size}`,
@@ -624,10 +654,12 @@ export class P2PTransferEngine {
         size: file.size,
         type: file.type || 'application/octet-stream',
         totalChunks,
+        chunkSize,
         crc32: crc,
         lastModified: file.lastModified,
-        compressed: isComp,
-        compressionRatio: isComp ? 2.5 : 1.0,
+        compressed: compEval.isCompressible,
+        compressionRatio: compEval.expectedRatio,
+        encrypted: this.e2ee.isReady(),
       });
     }
 
@@ -651,7 +683,9 @@ export class P2PTransferEngine {
       const file = files[fileIndex];
       const meta = manifest[fileIndex];
       const totalChunks = meta.totalChunks;
-      const isComp = !!isCompMap.get(fileIndex);
+      const fileSettings = compSettingsMap.get(fileIndex) || { isComp: false, chunkSize: DEFAULT_CHUNK_SIZE, expectedRatio: 1.0 };
+      const currentChunkSize = fileSettings.chunkSize;
+      const isComp = fileSettings.isComp;
 
       let chunksCompleted = 0;
       let effectiveSentForFile = 0;
@@ -660,14 +694,14 @@ export class P2PTransferEngine {
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
         if (this.cancelRequested) break;
 
-        const start = chunkIndex * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const start = chunkIndex * currentChunkSize;
+        const end = Math.min(start + currentChunkSize, file.size);
         const slice = file.slice(start, end);
         const rawArrayBuffer = await slice.arrayBuffer();
         const rawBytes = new Uint8Array(rawArrayBuffer);
         const rawLength = rawBytes.byteLength;
 
-        // Block-level in-flight compression without whole-file memory buffering
+        // 1. Block-level in-flight compression without whole-file memory buffering
         let payloadBytes: Uint8Array = rawBytes;
         let chunkIsCompressed = false;
 
@@ -679,12 +713,26 @@ export class P2PTransferEngine {
           }
         }
 
+        // 2. Block-level End-to-End Encryption with AES-256-GCM
+        let chunkIsEncrypted = false;
+        if (this.e2ee.isReady()) {
+          try {
+            payloadBytes = await this.e2ee.encryptChunk(chunkIndex, payloadBytes);
+            chunkIsEncrypted = true;
+          } catch (err) {
+            console.error('E2EE encryption error:', err);
+          }
+        }
+
         const payloadLength = payloadBytes.byteLength;
 
-        // Construct 16-byte binary header with compression bitflag
+        // Construct 16-byte binary header with compression and encryption bitflags
         const packet = new ArrayBuffer(HEADER_SIZE + payloadLength);
         const headerView = new DataView(packet, 0, HEADER_SIZE);
-        const fileIndexHeader = chunkIsCompressed ? (fileIndex | FLAG_COMPRESSED) : fileIndex;
+        let fileIndexHeader = fileIndex;
+        if (chunkIsCompressed) fileIndexHeader |= FLAG_COMPRESSED;
+        if (chunkIsEncrypted) fileIndexHeader |= FLAG_ENCRYPTED;
+
         headerView.setUint32(0, fileIndexHeader, false);
         headerView.setUint32(4, chunkIndex, false);
         headerView.setUint32(8, totalChunks, false);

@@ -11,6 +11,7 @@
     "test": "vitest run tests/unit",
     "test:integration": "node --expose-gc --import tsx tests/integration/sparse-transfer.test.ts",
     "benchmark": "node --expose-gc --import tsx tests/benchmarks/transport-benchmark.ts",
+    "benchmark:compression": "node --expose-gc --import tsx tests/benchmarks/compression-benchmark.ts",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

@@ -13,6 +13,7 @@ interface PairingSectionProps {
   onRegenerateCode: () => void;
   onJoinCode: (code: string) => void;
   isConnecting: boolean;
+  e2eeKey?: string;
 }
 
 export function PairingSection({
@@ -24,6 +25,7 @@ export function PairingSection({
   onRegenerateCode,
   onJoinCode,
   isConnecting,
+  e2eeKey,
 }: PairingSectionProps) {
   const displayCode = hostRoomCode || roomCode;
   const [digits, setDigits] = useState<string[]>(() => {
@@ -57,9 +59,10 @@ export function PairingSection({
     }
   }, [initialCode]);
 
-  // Build direct share URL
+  // Build direct share URL with E2EE key fragment
+  const hashKeyPart = e2eeKey ? `#key=${e2eeKey}` : '';
   const shareUrl = typeof window !== 'undefined' && displayCode && !isGeneratingCode
-    ? `${window.location.origin}${window.location.pathname}?code=${displayCode}&mode=${mode === 'send' ? 'receive' : 'send'}`
+    ? `${window.location.origin}${window.location.pathname}?code=${displayCode}&mode=${mode === 'send' ? 'receive' : 'send'}${hashKeyPart}`
     : '';
 
   useEffect(() => {

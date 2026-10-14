@@ -9,6 +9,8 @@ export interface FileMetadata {
   compressed?: boolean;
   compressedSize?: number;
   compressionRatio?: number;
+  chunkSize?: number;
+  encrypted?: boolean;
 }
 
 export interface TransferProgress {

@@ -22,6 +22,7 @@ export default function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [channelStats, setChannelStats] = useState<ChannelStat[]>([]);
+  const [e2eeKey, setE2eeKey] = useState<string>('');
 
   // Files to send
   const [filesToSend, setFilesToSend] = useState<File[]>([]);
@@ -135,6 +136,35 @@ export default function App() {
       setMode('receive');
     }
 
+    // Check E2EE key in URL hash (#key=<keyHex>.<saltHex>)
+    const hash = window.location.hash;
+    const keyMatch = hash.match(/key=([a-fA-F0-9]{64}\.[a-fA-F0-9]{8})/);
+    const engine = getOrCreateEngine();
+
+    if (keyMatch) {
+      const parsedKey = keyMatch[1];
+      setE2eeKey(parsedKey);
+      engine.setE2EEKey(parsedKey).catch(console.error);
+    } else if (urlMode !== 'receive' && !isValidUrlCode) {
+      // Sender: generate a fresh E2EE key and update URL hash
+      engine.e2ee.generate().then((res) => {
+        setE2eeKey(res.fragment);
+        const url = new URL(window.location.href);
+        url.hash = `key=${res.fragment}`;
+        window.history.replaceState({}, '', url.toString());
+      }).catch(console.error);
+    }
+
+    const onHashChange = () => {
+      const currentHash = window.location.hash;
+      const match = currentHash.match(/key=([a-fA-F0-9]{64}\.[a-fA-F0-9]{8})/);
+      if (match) {
+        setE2eeKey(match[1]);
+        engineRef.current?.setE2EEKey(match[1]).catch(console.error);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+
     const unsubscribe = signaling.subscribe(async (msg: SignalingMessage) => {
       switch (msg.type) {
         case 'room_created': {
@@ -211,6 +241,7 @@ export default function App() {
       });
 
     return () => {
+      window.removeEventListener('hashchange', onHashChange);
       unsubscribe();
       signaling.disconnect();
       engineRef.current?.cleanup();
@@ -248,6 +279,15 @@ export default function App() {
     setErrorMessage(null);
     setConnectionState('disconnected');
     engineRef.current?.cleanup();
+
+    const engine = getOrCreateEngine();
+    engine.e2ee.generate().then((res) => {
+      setE2eeKey(res.fragment);
+      const url = new URL(window.location.href);
+      url.hash = `key=${res.fragment}`;
+      window.history.replaceState({}, '', url.toString());
+    }).catch(console.error);
+
     signalingRef.current?.createRoom();
   };
 
@@ -377,6 +417,7 @@ export default function App() {
             onRegenerateCode={handleRegenerateCode}
             onJoinCode={handleJoinManualCode}
             isConnecting={connectionState === 'connecting_peer'}
+            e2eeKey={e2eeKey}
           />
         )}
 
