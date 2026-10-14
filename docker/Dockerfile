@@ -24,4 +24,4 @@ COPY --from=builder /app/engine ./engine
 
 EXPOSE 3000
 
-CMD ["node", "--loader", "tsx", "server/server.ts"]
+CMD ["node", "--import", "tsx", "server/server.ts"]
