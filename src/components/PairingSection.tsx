@@ -200,7 +200,7 @@ export function PairingSection({
   // Render 6-digit input form (used by receiver or sender entering receiver code)
   const renderDigitInputs = (submitLabel: string) => (
     <form onSubmit={handleManualCodeSubmit}>
-      <div className="flex justify-center gap-2 sm:gap-3 mb-6" onPaste={handlePaste}>
+      <div className="flex justify-center gap-1.5 sm:gap-3 mb-6" onPaste={handlePaste}>
         {[0, 1, 2, 3, 4, 5].map((index) => (
           <input
             key={index}
@@ -213,7 +213,7 @@ export function PairingSection({
             onChange={(e) => handleDigitChange(index, e.target.value)}
             onKeyDown={(e) => handleKeyDown(index, e)}
             disabled={isConnecting}
-            className="w-11 h-14 sm:w-13 sm:h-16 text-center text-2xl sm:text-3xl font-mono font-bold rounded-xl border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-800/80 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-neutral-900 dark:focus:border-neutral-100 focus:ring-1 focus:ring-neutral-900 dark:focus:ring-neutral-100 transition-all tabular-nums"
+            className="w-9 h-12 sm:w-12 sm:h-14 text-center text-xl sm:text-2xl font-mono font-bold rounded-lg sm:rounded-xl border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-800/80 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-neutral-900 dark:focus:border-neutral-100 focus:ring-1 focus:ring-neutral-900 dark:focus:ring-neutral-100 transition-all tabular-nums"
           />
         ))}
       </div>
@@ -245,7 +245,7 @@ export function PairingSection({
   if (mode === 'send') {
     return (
       <div className="w-full max-w-xl mx-auto mb-8">
-        <div className="bg-white dark:bg-neutral-900/70 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-8 text-center transition-colors shadow-sm">
+        <div className="bg-white dark:bg-neutral-900/70 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 sm:p-8 text-center transition-colors shadow-sm">
           {!senderEnteringCode ? (
             <>
               {/* 6-Digit Pair Code Display */}
@@ -399,7 +399,7 @@ export function PairingSection({
   // RECEIVER VIEW: Enter 6-digit code or Scan QR Code, or share your receiver code
   return (
     <div className="w-full max-w-xl mx-auto mb-8">
-      <div className="bg-white dark:bg-neutral-900/70 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-8 text-center transition-colors shadow-sm">
+      <div className="bg-white dark:bg-neutral-900/70 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 sm:p-8 text-center transition-colors shadow-sm">
         <div className="text-xs uppercase tracking-wider font-semibold text-neutral-400 mb-4">
           Enter Sender's 6-Digit Code
         </div>

@@ -581,35 +581,18 @@ export default function App() {
 
         {/* Transfer Progress and Metrics */}
         {(transferProgress || isSending || isReceiving) && (
-          <div className="w-full max-w-2xl mx-auto my-6 space-y-4">
+          <div className="w-full max-w-xl mx-auto my-6 space-y-3">
             <TransferProgress
               progress={transferProgress}
               channelStats={channelStats}
               onCancel={handleCancelTransfer}
+              onPauseResume={handlePauseResume}
+              isPaused={isPaused}
               fileName={currentFileName}
               isReceiving={mode === 'receive'}
             />
 
-            {/* Monochromatic Controls: Pause / Resume / Cancel */}
-            <div className="flex items-center justify-between px-2 pt-2 text-xs font-mono text-neutral-500">
-              <div className="flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={handlePauseResume}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-900 transition-colors cursor-pointer"
-                >
-                  {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-                  <span>{isPaused ? 'Resume' : 'Pause'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCancelTransfer}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-900 text-neutral-700 dark:text-neutral-300 transition-colors cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" />
-                  <span>Cancel</span>
-                </button>
-              </div>
+            {/* Controls are inside TransferProgress component */}
 
               {/* Small Monospace Root Hash Line */}
               {finalMerkleRoot && (
@@ -618,7 +601,6 @@ export default function App() {
                   <span className="truncate">Root: {finalMerkleRoot}</span>
                 </div>
               )}
-            </div>
           </div>
         )}
 
