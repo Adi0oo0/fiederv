@@ -19,6 +19,17 @@ export class MultipathController {
     this.scheduler = scheduler;
   }
 
+  public setScheduler(scheduler: WorkStealingScheduler): void {
+    this.scheduler = scheduler;
+    for (const [id, transport] of this.transports.entries()) {
+      this.scheduler.registerPipe(transport.id, transport.name, 2, 16);
+    }
+  }
+
+  public getTransports(): ITransport[] {
+    return Array.from(this.transports.values());
+  }
+
   public registerTransport(transport: ITransport, initialCwnd = 2, maxCwnd = 16): void {
     this.transports.set(transport.id, transport);
     this.scheduler.registerPipe(transport.id, transport.name, initialCwnd, maxCwnd);

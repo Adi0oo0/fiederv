@@ -25,6 +25,7 @@ import { HttpRelayTransport } from './transports/http-relay.js';
 
 export interface TransferEngineEvents {
   onStateChange?: (state: TransferState) => void;
+  onConnectionChange?: (state: string) => void;
   onProgress?: (progress: TransferProgress) => void;
   onSignal?: (signal: any) => void;
   onManifestReady?: (manifest: TransferManifest, shareUrl: string, keyFragment: string) => void;
@@ -36,6 +37,7 @@ export class TransferEngine {
   private config: EngineConfig;
   private events: TransferEngineEvents;
   private state: TransferState = 'idle';
+  private pendingEngineSignals: any[] = [];
 
   // Subsystems
   public crypto: TransferCrypto = new TransferCrypto();
@@ -124,11 +126,22 @@ export class TransferEngine {
 
     // 4. Initialize Scheduler & Multipath
     this.scheduler = new WorkStealingScheduler(this.manifest.totalChunks);
-    this.multipath = new MultipathController(this.scheduler);
+    if (!this.multipath) {
+      this.multipath = new MultipathController(this.scheduler);
+    } else {
+      this.multipath.setScheduler(this.scheduler);
+    }
     this.setupMultipathSenderPump();
 
-    // 5. Initialize WebRTC Multi-Association Peer Manager
-    this.setupWebRTC(true);
+    // 5. Initialize or reuse WebRTC Multi-Association Peer Manager
+    if (!this.webrtc || this.webrtc.getActiveChannels().length === 0) {
+      this.setupWebRTC(true);
+    } else {
+      for (const ch of this.webrtc.getActiveChannels()) {
+        ch.onFrame = (frame) => this.handleIncomingFrame(frame);
+        this.multipath.registerTransport(ch, 2, 8);
+      }
+    }
 
     // 6. Initialize HTTP Relay if enabled
     if (this.config.relayUrl) {
@@ -186,8 +199,20 @@ export class TransferEngine {
     );
 
     // 4. Multipath & WebRTC
-    this.multipath = new MultipathController(this.scheduler);
-    this.setupWebRTC(false);
+    if (!this.multipath) {
+      this.multipath = new MultipathController(this.scheduler);
+    } else {
+      this.multipath.setScheduler(this.scheduler);
+    }
+
+    if (!this.webrtc || this.webrtc.getActiveChannels().length === 0) {
+      this.setupWebRTC(false);
+    } else {
+      for (const ch of this.webrtc.getActiveChannels()) {
+        ch.onFrame = (frame) => this.handleIncomingFrame(frame);
+        this.multipath.registerTransport(ch, 2, 8);
+      }
+    }
 
     // 5. Initialize HTTP Relay if enabled
     if (this.config.relayUrl) {
@@ -230,10 +255,36 @@ export class TransferEngine {
     };
   }
 
+  public async initializeWebRTC(isInitiator: boolean, iceServers?: RTCIceServer[]): Promise<void> {
+    if (iceServers && iceServers.length > 0) {
+      this.config.iceServers = iceServers;
+    }
+
+    if (this.webrtc && this.webrtc.getActiveChannels().length > 0) {
+      if (this.events.onConnectionChange) {
+        this.events.onConnectionChange('connected');
+      }
+      return;
+    }
+
+    if (!this.scheduler) {
+      this.scheduler = new WorkStealingScheduler(1);
+    }
+    if (!this.multipath) {
+      this.multipath = new MultipathController(this.scheduler);
+    }
+
+    this.setupWebRTC(isInitiator);
+  }
+
   private setupWebRTC(isInitiator: boolean): void {
+    if (this.webrtc) {
+      try { this.webrtc.close(); } catch {}
+    }
+
     this.webrtc = new WebRTCPeerManager({
-      peerConnectionCount: 2, // 2 distinct SCTP associations
-      channelsPerPeer: 3,     // 3 channels each = 6 streams
+      peerConnectionCount: 1, // 1 reliable SCTP peer connection with multi-streams
+      channelsPerPeer: 4,     // 4 parallel data channels
       iceServers: this.config.iceServers,
       onSignal: (signal) => {
         if (this.events.onSignal) {
@@ -241,6 +292,9 @@ export class TransferEngine {
         }
       },
       onConnectionChange: (state) => {
+        if (this.events.onConnectionChange) {
+          this.events.onConnectionChange(state);
+        }
         if (state === 'connected') {
           if (this.state === 'waiting_peer') {
             this.acquireWakeLock();
@@ -258,6 +312,9 @@ export class TransferEngine {
     this.webrtc.onChannelReady = (channelTransport) => {
       channelTransport.onFrame = (frame) => this.handleIncomingFrame(frame);
       this.multipath?.registerTransport(channelTransport, 2, 8);
+      if (this.events.onConnectionChange) {
+        this.events.onConnectionChange('connected');
+      }
       if (this.state === 'waiting_peer') {
         this.acquireWakeLock();
         this.setState('transferring');
@@ -266,11 +323,30 @@ export class TransferEngine {
     };
 
     this.webrtc.initialize(isInitiator);
+
+    if (this.pendingEngineSignals.length > 0) {
+      const queued = [...this.pendingEngineSignals];
+      this.pendingEngineSignals = [];
+      for (const sig of queued) {
+        this.webrtc.handleSignal(sig).catch(console.error);
+      }
+    }
   }
 
   public async handleSignal(signal: any): Promise<void> {
     if (this.webrtc) {
       await this.webrtc.handleSignal(signal);
+    } else {
+      this.pendingEngineSignals.push(signal);
+    }
+  }
+
+  public startTransfer(): void {
+    if (this.state === 'waiting_peer' || this.state === 'idle') {
+      this.acquireWakeLock();
+      this.setState('transferring');
+      this.multipath?.start();
+      this.startProgressTicker();
     }
   }
 

@@ -181,13 +181,18 @@ export class WebRTCPeerManager {
   private channels: Map<string, WebRTCDataChannelTransport> = new Map();
   private options: WebRTCChannelOptions;
   public onChannelReady?: (transport: WebRTCDataChannelTransport) => void;
+  private pendingSignals: any[] = [];
+  private pendingCandidates: Map<number, any[]> = new Map();
+  private isInitiator: boolean = false;
+  private isClosed: boolean = false;
 
   constructor(options: WebRTCChannelOptions = {}) {
     this.options = {
-      peerConnectionCount: 2, // 2 parallel SCTP associations by default
-      channelsPerPeer: 3,     // 3 channels per peer = 6 total streams
+      peerConnectionCount: 1, // 1 reliable SCTP peer connection by default with multi-streams
+      channelsPerPeer: 4,     // 4 parallel data channels
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
       ],
       ...options,
@@ -198,13 +203,21 @@ export class WebRTCPeerManager {
     if (typeof RTCPeerConnection === 'undefined') {
       return;
     }
+    this.isInitiator = isInitiator;
+    this.isClosed = false;
 
-    const pcCount = Math.max(1, Math.min(4, this.options.peerConnectionCount || 2));
-    const channelsPerPc = Math.max(1, Math.min(8, this.options.channelsPerPeer || 3));
+    const pcCount = Math.max(1, Math.min(4, this.options.peerConnectionCount || 1));
+    const channelsPerPc = Math.max(1, Math.min(8, this.options.channelsPerPeer || 4));
 
     for (let pcIdx = 0; pcIdx < pcCount; pcIdx++) {
       const pc = new RTCPeerConnection({
-        iceServers: this.options.iceServers,
+        iceServers: this.options.iceServers && this.options.iceServers.length > 0
+          ? this.options.iceServers
+          : [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' },
+              { urls: 'stun:stun.cloudflare.com:3478' },
+            ],
         iceCandidatePoolSize: 4,
       });
 
@@ -220,9 +233,33 @@ export class WebRTCPeerManager {
         }
       };
 
+      pc.oniceconnectionstatechange = () => {
+        const ice = pc.iceConnectionState;
+        if (ice === 'connected' || ice === 'completed') {
+          if (this.options.onConnectionChange) {
+            this.options.onConnectionChange('connected');
+          }
+        } else if (ice === 'failed') {
+          try {
+            (pc as any).restartIce?.();
+          } catch {}
+        }
+      };
+
       pc.onconnectionstatechange = () => {
-        if (this.options.onConnectionChange) {
-          this.options.onConnectionChange(pc.connectionState);
+        const state = pc.connectionState;
+        if (state === 'connected') {
+          if (this.options.onConnectionChange) {
+            this.options.onConnectionChange('connected');
+          }
+        } else if (state === 'failed') {
+          if (this.options.onConnectionChange) {
+            this.options.onConnectionChange('failed');
+          }
+        } else if (state === 'disconnected') {
+          if (this.options.onConnectionChange) {
+            this.options.onConnectionChange('disconnected');
+          }
         }
       };
 
@@ -231,13 +268,15 @@ export class WebRTCPeerManager {
         for (let chIdx = 0; chIdx < channelsPerPc; chIdx++) {
           const chId = `pc${pcIdx}_ch${chIdx}`;
           const channel = pc.createDataChannel(chId, {
-            ordered: false,
-            maxRetransmits: 30,
+            ordered: true,
           });
 
           channel.onopen = () => {
             const transport = new WebRTCDataChannelTransport(chId, channel);
             this.channels.set(chId, transport);
+            if (this.options.onConnectionChange) {
+              this.options.onConnectionChange('connected');
+            }
             if (this.onChannelReady) {
               this.onChannelReady(transport);
             }
@@ -260,27 +299,74 @@ export class WebRTCPeerManager {
         pc.ondatachannel = (event) => {
           const channel = event.channel;
           const chId = channel.label || `pc${pcIdx}_rx_${Date.now()}`;
-          const transport = new WebRTCDataChannelTransport(chId, channel);
-          this.channels.set(chId, transport);
 
           channel.onopen = () => {
+            const transport = new WebRTCDataChannelTransport(chId, channel);
+            this.channels.set(chId, transport);
+            if (this.options.onConnectionChange) {
+              this.options.onConnectionChange('connected');
+            }
             if (this.onChannelReady) {
               this.onChannelReady(transport);
             }
           };
+
+          if (channel.readyState === 'open') {
+            const transport = new WebRTCDataChannelTransport(chId, channel);
+            this.channels.set(chId, transport);
+            if (this.options.onConnectionChange) {
+              this.options.onConnectionChange('connected');
+            }
+            if (this.onChannelReady) {
+              this.onChannelReady(transport);
+            }
+          }
         };
+      }
+    }
+
+    // Drain any pending early signals
+    if (this.pendingSignals.length > 0) {
+      const queued = [...this.pendingSignals];
+      this.pendingSignals = [];
+      for (const sig of queued) {
+        await this.handleSignal(sig);
       }
     }
   }
 
   public async handleSignal(signal: any): Promise<void> {
+    if (this.isClosed) return;
     const pcIdx = typeof signal.pcIndex === 'number' ? signal.pcIndex : 0;
     const pc = this.peerConnections[pcIdx];
-    if (!pc) return;
+    if (!pc) {
+      this.pendingSignals.push(signal);
+      return;
+    }
 
     try {
       if (signal.type === 'offer') {
+        if (pc.signalingState !== 'stable') {
+          if (!this.isInitiator) {
+            await pc.setLocalDescription({ type: 'rollback' });
+          } else {
+            return;
+          }
+        }
+
         await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
+
+        // Drain pending candidates for this PC
+        const queuedCands = this.pendingCandidates.get(pcIdx) || [];
+        this.pendingCandidates.delete(pcIdx);
+        for (const cand of queuedCands) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(cand));
+          } catch (e) {
+            console.warn(`Queued candidate error on PC ${pcIdx}:`, e);
+          }
+        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
@@ -294,8 +380,26 @@ export class WebRTCPeerManager {
       } else if (signal.type === 'answer') {
         if (pc.signalingState !== 'stable') {
           await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
+
+          // Drain pending candidates for this PC
+          const queuedCands = this.pendingCandidates.get(pcIdx) || [];
+          this.pendingCandidates.delete(pcIdx);
+          for (const cand of queuedCands) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(cand));
+            } catch (e) {
+              console.warn(`Queued candidate error on PC ${pcIdx}:`, e);
+            }
+          }
         }
       } else if (signal.type === 'candidate' && signal.candidate) {
+        if (!pc.remoteDescription) {
+          if (!this.pendingCandidates.has(pcIdx)) {
+            this.pendingCandidates.set(pcIdx, []);
+          }
+          this.pendingCandidates.get(pcIdx)!.push(signal.candidate);
+          return;
+        }
         try {
           await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
         } catch (e) {
@@ -312,6 +416,10 @@ export class WebRTCPeerManager {
   }
 
   public async close(): Promise<void> {
+    this.isClosed = true;
+    this.pendingSignals = [];
+    this.pendingCandidates.clear();
+
     for (const ch of this.channels.values()) {
       await ch.close();
     }

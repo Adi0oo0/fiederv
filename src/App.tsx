@@ -86,6 +86,16 @@ export default function App() {
         relayUrl: typeof window !== 'undefined' ? window.location.origin : '',
       },
       {
+        onConnectionChange: (state) => {
+          if (state === 'connected') {
+            setConnectionState('connected');
+          } else if (state === 'failed') {
+            setConnectionState('failed');
+            sound.playError();
+          } else if (state === 'disconnected') {
+            setConnectionState('disconnected');
+          }
+        },
         onStateChange: (state) => {
           if (state === 'transferring') {
             setConnectionState('connected');
@@ -195,15 +205,28 @@ export default function App() {
 
         case 'room_joined': {
           setRoomCode(msg.roomId || '');
-          setPeersCount(msg.payload?.peersCount || 1);
+          const count = msg.payload?.peersCount || 1;
+          setPeersCount(count);
           setIsGeneratingCode(false);
           setErrorMessage(null);
+
+          if (count >= 2) {
+            const engine = getOrCreateEngine();
+            engine.initializeWebRTC(false, cachedIceServersRef.current);
+          }
           break;
         }
 
         case 'peer_joined': {
           setPeersCount((prev) => prev + 1);
           setErrorMessage(null);
+
+          const isInitiator = msg.initiator !== undefined
+            ? Boolean(msg.initiator)
+            : Boolean(msg.payload?.initiator);
+
+          const engine = getOrCreateEngine();
+          engine.initializeWebRTC(isInitiator, cachedIceServersRef.current);
 
           // If sender has key, synchronize with peer immediately upon pairing
           if (e2eeKeyRef.current) {
@@ -251,6 +274,9 @@ export default function App() {
           } else if (payload.type === 'p2p_signal' && payload.signal) {
             const engine = getOrCreateEngine();
             engine.handleSignal(payload.signal);
+          } else if (payload.type === 'receiver_ready') {
+            const engine = getOrCreateEngine();
+            engine.startTransfer();
           }
           break;
         }
@@ -463,7 +489,10 @@ export default function App() {
       }
       diskWriterRef.current = writer;
 
-      await engine.prepareReceiver(incomingManifest, e2eeKey, writer);
+      await engine.prepareReceiver(incomingManifest, e2eeKeyRef.current || e2eeKey, writer);
+      signalingRef.current?.sendSignal({
+        type: 'receiver_ready',
+      });
     } catch (err: any) {
       console.error('Receiver streaming error:', err);
       setIsReceiving(false);
