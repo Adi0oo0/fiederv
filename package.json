@@ -13,6 +13,7 @@
     "benchmark": "node --expose-gc --import tsx tests/benchmarks/transport-benchmark.ts",
     "benchmark:compression": "node --expose-gc --import tsx tests/benchmarks/compression-benchmark.ts",
     "lint": "tsc --noEmit",
+    "deploy": "npm run build && npx wrangler deploy",
     "deploy:cf": "npm run build && npx wrangler pages deploy dist"
   },
   "dependencies": {
