@@ -1,0 +1,28 @@
+services:
+  drop-relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - TURN_SERVER_URL=turn:turn:3478
+      - TURN_USERNAME=dropuser
+      - TURN_PASSWORD=droppassword
+    volumes:
+      - drop-chunks:/app/.drop_chunks
+    depends_on:
+      - turn
+    restart: unless-stopped
+
+  turn:
+    image: coturn/coturn:latest
+    network_mode: "host"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped
+
+volumes:
+  drop-chunks:
