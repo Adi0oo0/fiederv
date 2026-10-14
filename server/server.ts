@@ -409,6 +409,18 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason);
 });
 
+process.on('exit', (code) => {
+  console.log(`Drop server process exit event with code: ${code}`);
+});
+
+process.on('SIGINT', () => {
+  console.log('Drop server received SIGINT');
+});
+
+process.on('SIGTERM', () => {
+  console.log('Drop server received SIGTERM');
+});
+
 start().catch((err) => {
   console.error('Server failed to start:', err);
   process.exit(1);
