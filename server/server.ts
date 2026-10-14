@@ -7,6 +7,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
+import middie from '@fastify/middie';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { RelayChunkStore } from './relay-store.js';
@@ -49,6 +50,7 @@ if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN
 async function start() {
   await app.register(cors, { origin: true });
   await app.register(websocket);
+  await app.register(middie);
 
   // Health and STUN/TURN server endpoints
   app.get('/api/health', async () => ({ status: 'healthy', uptime: process.uptime() }));
@@ -239,8 +241,18 @@ async function start() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    // @ts-expect-error vite middleware with fastify
-    app.use(vite.middlewares);
+    // Pass-through for /api and /ws routes to Fastify handlers
+    app.use((req: any, res: any, next: any) => {
+      if (req.url && (req.url.startsWith('/api') || req.url.startsWith('/ws'))) {
+        return next();
+      }
+      vite.middlewares(req, res, next);
+    });
+    app.setNotFoundHandler((req, reply) => {
+      vite.middlewares(req.raw, reply.raw, () => {
+        reply.status(404).send({ error: 'Not found' });
+      });
+    });
   }
 
   await app.listen({ port: PORT, host: '0.0.0.0' });
