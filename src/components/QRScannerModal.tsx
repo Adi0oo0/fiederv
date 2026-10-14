@@ -2,10 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import jsQR from 'jsqr';
 import { Camera, X, Upload, AlertCircle, RefreshCw } from 'lucide-react';
 
+export interface ScannedQRResult {
+  code: string;
+  keyFragment?: string;
+}
+
 interface QRScannerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onScanSuccess: (code: string) => void;
+  onScanSuccess: (result: ScannedQRResult) => void;
 }
 
 export function QRScannerModal({ isOpen, onClose, onScanSuccess }: QRScannerModalProps) {
@@ -17,18 +22,21 @@ export function QRScannerModal({ isOpen, onClose, onScanSuccess }: QRScannerModa
   const animationFrameRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const extractCode = (text: string): string | null => {
+  const extractCode = (text: string): ScannedQRResult | null => {
     const clean = text.trim();
-    if (/^\d{6}$/.test(clean)) return clean;
+    if (/^\d{6}$/.test(clean)) return { code: clean };
     try {
       const url = new URL(clean);
       const codeParam = url.searchParams.get('code');
+      const hash = url.hash;
+      const keyMatch = hash.match(/key=([a-fA-F0-9]{64}\.[a-fA-F0-9]{8})/);
+      const keyFragment = keyMatch ? keyMatch[1] : undefined;
       if (codeParam && /^\d{6}$/.test(codeParam)) {
-        return codeParam;
+        return { code: codeParam, keyFragment };
       }
     } catch (e) {
       const match = clean.match(/\b\d{6}\b/);
-      if (match) return match[0];
+      if (match) return { code: match[0] };
     }
     return null;
   };

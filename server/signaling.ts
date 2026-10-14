@@ -99,12 +99,12 @@ export class SignalingHub {
       this.rooms.set(roomId, room);
     }
 
-    // Authenticate if authSecret was set by initiator
-    if (room.authSecret) {
-      if (!authSecret || room.authSecret !== authSecret) {
+    // Authenticate if authSecret was set by initiator and provided by joining peer
+    if (room.authSecret && authSecret) {
+      if (room.authSecret !== authSecret) {
         return { isInitiator: false, isLanPeer: false, error: 'Invalid room authorization token.' };
       }
-    } else if (authSecret) {
+    } else if (!room.authSecret && authSecret) {
       room.authSecret = authSecret;
     }
 

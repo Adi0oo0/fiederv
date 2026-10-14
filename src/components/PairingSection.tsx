@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode';
 import { Copy, Check, QrCode as QrIcon, ArrowRight, Link as LinkIcon, RefreshCw, Camera, Keyboard } from 'lucide-react';
 import { formatCode } from '../lib/format';
-import { QRScannerModal } from './QRScannerModal';
+import { QRScannerModal, type ScannedQRResult } from './QRScannerModal';
 
 interface PairingSectionProps {
   mode: 'send' | 'receive';
@@ -11,7 +11,7 @@ interface PairingSectionProps {
   initialCode?: string;
   isGeneratingCode: boolean;
   onRegenerateCode: () => void;
-  onJoinCode: (code: string) => void;
+  onJoinCode: (code: string, keyFragment?: string) => void;
   isConnecting: boolean;
   e2eeKey?: string;
 }
@@ -186,12 +186,12 @@ export function PairingSection({
     }
   };
 
-  const handleQRScanned = (scannedCode: string) => {
-    const clean = scannedCode.replace(/\D/g, '').slice(0, 6);
+  const handleQRScanned = (result: ScannedQRResult) => {
+    const clean = result.code.replace(/\D/g, '').slice(0, 6);
     const next = clean.split('').concat(Array(Math.max(0, 6 - clean.length)).fill(''));
     setDigits(next);
     if (clean.length === 6 && !isConnecting) {
-      onJoinCode(clean);
+      onJoinCode(clean, result.keyFragment);
     }
   };
 

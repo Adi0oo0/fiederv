@@ -401,6 +401,14 @@ async function start() {
   console.log(`Drop server listening on http://0.0.0.0:${PORT}`);
 }
 
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
 start().catch((err) => {
   console.error('Server failed to start:', err);
   process.exit(1);

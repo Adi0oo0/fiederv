@@ -4,8 +4,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server/server.ts",
-    "start": "tsx server/server.ts",
+    "dev": "node --import tsx server/server.ts",
+    "start": "node --import tsx server/server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run tests/unit",

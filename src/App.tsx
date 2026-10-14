@@ -205,6 +205,14 @@ export default function App() {
           setPeersCount((prev) => prev + 1);
           setErrorMessage(null);
 
+          // If sender has key, synchronize with peer immediately upon pairing
+          if (e2eeKeyRef.current) {
+            signaling.sendSignal({
+              type: 'key_sync',
+              keyFragment: e2eeKeyRef.current,
+            });
+          }
+
           // If sender has prepared manifest, dispatch it to peer
           if (activeManifestRef.current) {
             signaling.sendSignal({
@@ -226,10 +234,15 @@ export default function App() {
           const payload = msg.payload;
           if (!payload) break;
 
-          if (payload.type === 'manifest_init' && payload.manifest) {
+          if (payload.type === 'key_sync' && payload.keyFragment) {
+            setE2eeKey(payload.keyFragment);
+            e2eeKeyRef.current = payload.keyFragment;
+            const engine = getOrCreateEngine();
+            engine.crypto.initFromFragment(payload.keyFragment).catch(console.error);
+          } else if (payload.type === 'manifest_init' && payload.manifest) {
             setIncomingManifest(payload.manifest);
             activeManifestRef.current = payload.manifest;
-            if (payload.keyFragment && !e2eeKeyRef.current) {
+            if (payload.keyFragment) {
               setE2eeKey(payload.keyFragment);
               e2eeKeyRef.current = payload.keyFragment;
               const engine = getOrCreateEngine();
@@ -349,7 +362,7 @@ export default function App() {
     });
   };
 
-  const handleJoinManualCode = (code: string) => {
+  const handleJoinManualCode = async (code: string, keyFragment?: string) => {
     if (!code) return;
     const clean = code.trim();
     if (clean === roomCode && (connectionState === 'connected' || connectionState === 'connecting_peer')) {
@@ -359,7 +372,19 @@ export default function App() {
     setConnectionState('connecting_peer');
     engineRef.current?.cancel();
     const engine = getOrCreateEngine();
-    const authSecret = engine.crypto.isReady() ? engine.crypto.getAuthSecret() : undefined;
+
+    let authSecret: string | undefined;
+    if (keyFragment) {
+      try {
+        await engine.crypto.initFromFragment(keyFragment);
+        setE2eeKey(keyFragment);
+        e2eeKeyRef.current = keyFragment;
+        authSecret = engine.crypto.getAuthSecret();
+      } catch (e) {
+        console.warn('Failed to parse fragment from QR scan', e);
+      }
+    }
+
     signalingRef.current?.joinRoom(clean, authSecret);
     setRoomCode(clean);
   };
