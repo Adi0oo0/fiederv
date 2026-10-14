@@ -1,6 +1,7 @@
 /**
  * Drop Fastify Relay and Signaling Server
  * Zero-knowledge encrypted chunk store, WebSocket signaling, and Coturn integration.
+ * Streams all chunk I/O directly to disk without in-memory buffering.
  */
 
 import Fastify from 'fastify';
@@ -8,6 +9,7 @@ import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
 import middie from '@fastify/middie';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { RelayChunkStore } from './relay-store.js';
@@ -21,61 +23,101 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 const app = Fastify({
   logger: false,
-  bodyLimit: 128 * 1024 * 1024, // 128 MB max chunk payload
+});
+
+// Configure streaming content parser to avoid buffering large payloads in RAM
+app.addContentTypeParser('application/octet-stream', (_req, _payload, done) => {
+  done(null);
 });
 
 const chunkStore = new RelayChunkStore({
   baseDir: './.drop_chunks',
   defaultTtlMs: 24 * 60 * 60 * 1000,
+  maxChunkSizeBytes: 64 * 1024 * 1024,
 });
 
 const signalingHub = new SignalingHub();
 
-// Public STUN & TURN servers for reliable traversal across symmetric NATs
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-];
-
-if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_PASSWORD) {
-  ICE_SERVERS.push({
-    urls: process.env.TURN_SERVER_URL,
-    // @ts-expect-error turn server credentials
-    username: process.env.TURN_USERNAME,
-    credential: process.env.TURN_PASSWORD,
-  });
-}
-
 async function start() {
-  await app.register(cors, { origin: true });
+  // Restrict CORS in production
+  await app.register(cors, {
+    origin: isProduction
+      ? (origin, cb) => {
+          if (!origin || origin.startsWith('http://localhost') || origin.startsWith('https://')) {
+            cb(null, true);
+          } else {
+            cb(new Error('Not allowed by CORS'), false);
+          }
+        }
+      : true,
+  });
+
   await app.register(websocket);
   await app.register(middie);
 
-  // Health and STUN/TURN server endpoints
+  // Health and STUN/TURN server endpoints with time-limited HMAC credentials
   app.get('/api/health', async () => ({ status: 'healthy', uptime: process.uptime() }));
-  app.get('/api/ice-servers', async () => ({ iceServers: ICE_SERVERS }));
 
-  // HTTP Signaling fallback
+  app.get('/api/ice-servers', async (req) => {
+    const iceServers: any[] = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ];
+
+    const turnUrl = process.env.TURN_SERVER_URL;
+    const turnSecret = process.env.COTURN_AUTH_SECRET || process.env.TURN_SECRET;
+
+    if (turnUrl && turnSecret) {
+      // Coturn ephemeral time-limited REST credentials (RFC 5766)
+      const ttl = 24 * 3600; // 24 hours
+      const timestamp = Math.floor(Date.now() / 1000) + ttl;
+      const cleanIp = (req.ip || 'peer').replace(/[^a-zA-Z0-9]/g, '');
+      const username = `${timestamp}:${cleanIp}`;
+
+      const hmac = crypto.createHmac('sha1', turnSecret);
+      hmac.update(username);
+      const credential = hmac.digest('base64');
+
+      iceServers.push({
+        urls: turnUrl,
+        username,
+        credential,
+      });
+    } else if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_PASSWORD) {
+      iceServers.push({
+        urls: process.env.TURN_SERVER_URL,
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_PASSWORD,
+      });
+    }
+
+    return { iceServers };
+  });
+
+  // HTTP Signaling fallback endpoints
   app.post('/api/signaling/create', async (req) => {
-    const { peerId } = (req.body as any) || {};
+    const { peerId, authSecret } = (req.body as any) || {};
     const assignedPeerId = peerId || Math.random().toString(36).substring(2, 9);
-    const roomId = signalingHub.generateRoomCode();
-    signalingHub.joinRoom(roomId, assignedPeerId, req.ip);
+    const roomId = signalingHub.createRoom(authSecret);
+    signalingHub.joinRoom(roomId, assignedPeerId, req.ip, undefined, authSecret);
     return { roomId, peerId: assignedPeerId };
   });
 
   app.post('/api/signaling/join', async (req, reply) => {
-    const { roomId, peerId } = (req.body as any) || {};
+    const { roomId, peerId, authSecret } = (req.body as any) || {};
     if (!roomId) {
       return reply.status(400).send({ error: 'Room ID is required.' });
     }
     const assignedPeerId = peerId || Math.random().toString(36).substring(2, 9);
-    const result = signalingHub.joinRoom(roomId, assignedPeerId, req.ip);
+    const result = signalingHub.joinRoom(roomId, assignedPeerId, req.ip, undefined, authSecret);
+    if (result.error) {
+      return reply.status(403).send({ error: result.error });
+    }
     return { roomId, peerId: assignedPeerId, ...result };
   });
 
-  // Zero-Knowledge Encrypted Chunk Relay Endpoints
+  // Zero-Knowledge Encrypted Chunk Relay Endpoints (Streaming I/O directly to disk)
   // PUT /api/relay/:sessionId/chunk/:index
   app.put('/api/relay/:sessionId/chunk/:index', async (req, reply) => {
     const { sessionId, index } = req.params as { sessionId: string; index: string };
@@ -84,14 +126,24 @@ async function start() {
       return reply.status(400).send({ error: 'Invalid chunk index' });
     }
 
-    // Read raw body stream or buffer
-    const buffer = await req.body as Buffer;
-    if (!buffer || buffer.length === 0) {
-      return reply.status(400).send({ error: 'Empty chunk payload' });
+    // Check authorization token if session has registered an auth secret
+    const meta = await chunkStore.getSessionMeta(sessionId);
+    if (meta && meta.authSecret) {
+      const authHeader = req.headers.authorization;
+      const expected = `Bearer ${meta.authSecret}`;
+      if (authHeader !== expected) {
+        return reply.status(401).send({ error: 'Unauthorized chunk upload' });
+      }
     }
 
-    await chunkStore.putChunk(sessionId, chunkIndex, buffer);
-    return reply.status(200).send({ success: true, chunkIndex, bytes: buffer.length });
+    try {
+      // Stream directly from HTTP request to disk (.tmp -> atomic rename)
+      const writtenBytes = await chunkStore.putChunkStream(sessionId, chunkIndex, req.raw);
+      return reply.status(200).send({ success: true, chunkIndex, bytes: writtenBytes });
+    } catch (err: any) {
+      console.error(`Chunk upload error ${sessionId}#${chunkIndex}:`, err);
+      return reply.status(500).send({ error: err.message || 'Failed to save chunk' });
+    }
   });
 
   // GET /api/relay/:sessionId/chunk/:index
@@ -102,7 +154,17 @@ async function start() {
       return reply.status(400).send({ error: 'Invalid chunk index' });
     }
 
-    // Check Range header
+    const meta = await chunkStore.getSessionMeta(sessionId);
+    if (meta && meta.authSecret) {
+      const authHeader = req.headers.authorization;
+      const queryAuth = (req.query as any)?.auth;
+      const expected = meta.authSecret;
+      if (authHeader !== `Bearer ${expected}` && queryAuth !== expected) {
+        return reply.status(401).send({ error: 'Unauthorized chunk download' });
+      }
+    }
+
+    // Parse HTTP Range header if requested
     let range: { start: number; end: number } | undefined;
     const rangeHeader = req.headers.range;
     if (rangeHeader && rangeHeader.startsWith('bytes=')) {
@@ -114,8 +176,8 @@ async function start() {
       }
     }
 
-    const chunk = await chunkStore.getChunk(sessionId, chunkIndex, range);
-    if (!chunk) {
+    const chunkResult = await chunkStore.getChunkStream(sessionId, chunkIndex, range);
+    if (!chunkResult) {
       return reply.status(404).send({ error: 'Chunk not found' });
     }
 
@@ -123,48 +185,62 @@ async function start() {
     reply.header('Accept-Ranges', 'bytes');
 
     if (range) {
-      const actualEnd = Math.min(chunk.totalSize - 1, range.end);
+      const actualEnd = Math.min(chunkResult.totalSize - 1, range.end);
       reply.status(206);
-      reply.header('Content-Range', `bytes ${range.start}-${actualEnd}/${chunk.totalSize}`);
+      reply.header('Content-Range', `bytes ${range.start}-${actualEnd}/${chunkResult.totalSize}`);
     } else {
       reply.status(200);
-      reply.header('Content-Length', chunk.data.length);
+      reply.header('Content-Length', chunkResult.totalSize);
     }
 
-    return reply.send(chunk.data);
+    return reply.send(chunkResult.stream);
   });
 
-  // DELETE /api/relay/:sessionId (Atomic cleanup on completion)
+  // DELETE /api/relay/:sessionId
   app.delete('/api/relay/:sessionId', async (req, reply) => {
     const { sessionId } = req.params as { sessionId: string };
-    await chunkStore.deleteSession(sessionId);
-    return reply.status(200).send({ success: true });
+    const meta = await chunkStore.getSessionMeta(sessionId);
+    if (meta && meta.authSecret) {
+      const authHeader = req.headers.authorization;
+      if (authHeader !== `Bearer ${meta.authSecret}`) {
+        return reply.status(401).send({ error: 'Unauthorized' });
+      }
+    }
+    const success = await chunkStore.deleteSession(sessionId);
+    return reply.status(200).send({ success });
   });
 
-  // WebSocket Signaling Channel
-  app.get('/ws', { websocket: true }, (socket, req) => {
+  // WebSocket Signaling Connection
+  app.get('/ws/signaling', { websocket: true }, (socket, req) => {
     let currentRoomId: string | null = null;
     let currentPeerId: string | null = null;
-    const clientIp = req.ip;
+    const clientIp = req.socket.remoteAddress || req.ip || 'unknown';
 
-    socket.on('message', (raw) => {
+    socket.on('message', (data: Buffer | string) => {
       try {
-        const msg = JSON.parse(raw.toString());
-        const { type, roomId, peerId, payload } = msg;
+        const msg = JSON.parse(data.toString());
+        const { type, roomId, peerId, payload, authSecret } = msg;
 
         switch (type) {
           case 'create_room': {
-            const code = signalingHub.generateRoomCode();
-            currentRoomId = code;
+            const assignedRoomId = roomId || signalingHub.createRoom(authSecret);
+            currentRoomId = assignedRoomId;
             currentPeerId = peerId || Math.random().toString(36).substring(2, 9);
-            const { isInitiator } = signalingHub.joinRoom(code, currentPeerId, clientIp, socket);
+            const { isInitiator, isLanPeer } = signalingHub.joinRoom(
+              assignedRoomId,
+              currentPeerId,
+              clientIp,
+              socket,
+              authSecret
+            );
 
             socket.send(
               JSON.stringify({
                 type: 'room_created',
-                roomId: code,
+                roomId: assignedRoomId,
                 peerId: currentPeerId,
                 initiator: isInitiator,
+                isLanPeer,
               })
             );
             break;
@@ -173,20 +249,31 @@ async function start() {
           case 'join_room': {
             currentRoomId = roomId;
             currentPeerId = peerId || Math.random().toString(36).substring(2, 9);
-            const { isInitiator, isLanPeer } = signalingHub.joinRoom(
+            const result = signalingHub.joinRoom(
               roomId,
               currentPeerId,
               clientIp,
-              socket
+              socket,
+              authSecret
             );
+
+            if (result.error) {
+              socket.send(
+                JSON.stringify({
+                  type: 'error',
+                  message: result.error,
+                })
+              );
+              return;
+            }
 
             socket.send(
               JSON.stringify({
                 type: 'room_joined',
                 roomId,
                 peerId: currentPeerId,
-                initiator: isInitiator,
-                isLanPeer,
+                initiator: result.isInitiator,
+                isLanPeer: result.isLanPeer,
               })
             );
             break;
@@ -213,7 +300,7 @@ async function start() {
           }
         }
       } catch (e) {
-        console.error('WS message error:', e);
+        console.error('WS message parsing error:', e);
       }
     });
 
@@ -241,18 +328,7 @@ async function start() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    // Pass-through for /api and /ws routes to Fastify handlers
-    app.use((req: any, res: any, next: any) => {
-      if (req.url && (req.url.startsWith('/api') || req.url.startsWith('/ws'))) {
-        return next();
-      }
-      vite.middlewares(req, res, next);
-    });
-    app.setNotFoundHandler((req, reply) => {
-      vite.middlewares(req.raw, reply.raw, () => {
-        reply.status(404).send({ error: 'Not found' });
-      });
-    });
+    app.use(vite.middlewares);
   }
 
   await app.listen({ port: PORT, host: '0.0.0.0' });

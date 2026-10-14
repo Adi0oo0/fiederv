@@ -1,24 +1,36 @@
 services:
+  caddy:
+    image: caddy:2.8.4-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 QUIC
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - drop-relay
+    restart: unless-stopped
+
   drop-relay:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
+    user: "node" # Run container as non-root user
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - TURN_SERVER_URL=turn:turn:3478
-      - TURN_USERNAME=dropuser
-      - TURN_PASSWORD=droppassword
+      - COTURN_AUTH_SECRET=drop_production_coturn_secret_2026
+      - TURN_SERVER_URL=${PUBLIC_TURN_URL:-turn:127.0.0.1:3478}
     volumes:
       - drop-chunks:/app/.drop_chunks
-    depends_on:
-      - turn
     restart: unless-stopped
 
   turn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.6.2-alpine # Pinned image tag
     network_mode: "host"
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
@@ -26,3 +38,5 @@ services:
 
 volumes:
   drop-chunks:
+  caddy-data:
+  caddy-config:

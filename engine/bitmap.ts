@@ -127,6 +127,7 @@ export interface StoredSession {
   totalChunks: number;
   merkleRoot: string;
   bitmapBase64: string;
+  leafHashes?: string[];
   updatedAt: number;
 }
 

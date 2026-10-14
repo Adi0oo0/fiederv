@@ -120,8 +120,8 @@ async function runIntegrationTest() {
     const ciphertext = await senderCrypto.encryptChunk(chunkIdx, plaintext);
     const nonce = senderCrypto.constructNonce(chunkIdx);
 
-    // Wire frame encode & decode
-    const wireFrame = FrameCodec.encodeDataFrame(chunkIdx, hash, nonce, ciphertext);
+    // Wire frame encode & decode (zero-knowledge: no plaintext hash in header)
+    const wireFrame = FrameCodec.encodeDataFrame(chunkIdx, nonce, ciphertext);
     const decoded = FrameCodec.decodeFrame(wireFrame);
 
     if (!decoded) {
@@ -129,14 +129,15 @@ async function runIntegrationTest() {
       continue;
     }
 
-    // Receiver decrypts and verifies leaf hash
-    const decrypted = await receiverCrypto.decryptChunk(decoded.chunkIndex, decoded.payload);
-    const verifiedHash = await Hasher.hashChunk(decrypted);
-
-    if (Hasher.toHex(verifiedHash) !== Hasher.toHex(decoded.hash)) {
+    // Receiver decrypts and computes leaf hash
+    let decrypted: Uint8Array;
+    try {
+      decrypted = await receiverCrypto.decryptChunk(decoded.chunkIndex, decoded.payload);
+    } catch {
       senderScheduler.onChunkNack(chunkIdx);
       continue;
     }
+    const verifiedHash = await Hasher.hashChunk(decrypted);
 
     // Store verified chunk
     receiverLeaves[chunkIdx] = verifiedHash;

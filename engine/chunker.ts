@@ -1,7 +1,8 @@
 /**
  * File Chunker for Drop
  * Zero-memory buffering streaming reader using Blob.slice() and File.stream().
- * Never loads whole files into memory.
+ * Never loads whole files into memory. Supports instant manifest generation
+ * without upfront 100 GB hashing pre-passes.
  */
 
 import { ChunkInfo, TransferManifest } from './types.js';
@@ -64,8 +65,8 @@ export class FileChunker {
 
   constructor(source: ChunkSource, chunkSize: number = 8 * 1024 * 1024) {
     this.source = source;
-    // Chunk size between 4MB and 64MB
-    this.chunkSize = Math.max(4 * 1024 * 1024, Math.min(64 * 1024 * 1024, chunkSize));
+    // Adaptive chunk size between 256 KB and 64 MB
+    this.chunkSize = Math.max(256 * 1024, Math.min(64 * 1024 * 1024, chunkSize));
     this.totalChunks = Math.ceil(source.size / this.chunkSize) || 1;
   }
 
@@ -92,9 +93,24 @@ export class FileChunker {
   }
 
   /**
-   * Generates whole-file TransferManifest and Merkle tree root.
-   * Streams chunks sequentially or with bounded concurrency (default 4)
-   * to guarantee flat memory usage (< 50 MB) even on 100+ GB files.
+   * Generates manifest immediately without blocking or pre-reading the entire file.
+   * Transfer starts in 0 milliseconds; Merkle root is streamed and finalized at the end.
+   */
+  public createInstantManifest(sessionId: string, saltHex: string): TransferManifest {
+    return {
+      sessionId,
+      name: this.source.name,
+      size: this.source.size,
+      chunkSize: this.chunkSize,
+      totalChunks: this.totalChunks,
+      merkleRoot: 'streaming',
+      saltHex,
+      createdAt: Date.now(),
+    };
+  }
+
+  /**
+   * Generates whole-file TransferManifest and Merkle tree root upfront (for tests and benchmarks).
    */
   public async generateManifest(
     sessionId: string,
@@ -105,11 +121,9 @@ export class FileChunker {
     let processedBytes = 0;
 
     for (let i = 0; i < this.totalChunks; i++) {
-      const chunkData = await this.readChunk(i);
-      const leafHash = await Hasher.hashChunk(chunkData);
-      leafHashes[i] = leafHash;
-      processedBytes += chunkData.length;
-
+      const chunk = await this.readChunk(i);
+      leafHashes[i] = await Hasher.hashChunk(chunk);
+      processedBytes += chunk.length;
       if (onProgress) {
         onProgress(processedBytes, this.source.size);
       }
@@ -125,7 +139,8 @@ export class FileChunker {
       chunkSize: this.chunkSize,
       totalChunks: this.totalChunks,
       merkleRoot,
-      salt: saltHex,
+      saltHex,
+      createdAt: Date.now(),
     };
 
     return { manifest, leafHashes };

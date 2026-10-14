@@ -1,0 +1,24 @@
+# Caddy reverse proxy with native HTTP/2 and HTTP/3 (QUIC) support for Drop
+{
+    admin off
+}
+
+:80, :443 {
+    # Enable HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) multiplexed streams
+    protocols h1 h2 h3
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none';"
+    }
+
+    reverse_proxy drop-relay:3000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

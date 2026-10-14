@@ -90,8 +90,8 @@ async function benchmarkTransport(
       let ciphertext: Uint8Array | null = await senderCrypto.encryptChunk(chunkIdx, plaintext);
       const nonce = senderCrypto.constructNonce(chunkIdx);
 
-      // Frame
-      let frame: Uint8Array | null = FrameCodec.encodeDataFrame(chunkIdx, hash, nonce, ciphertext);
+      // Frame (zero-knowledge)
+      let frame: Uint8Array | null = FrameCodec.encodeDataFrame(chunkIdx, nonce, ciphertext);
 
       // Simulate network traversal
       if (simulatedNetworkLatencyMs > 0) {

@@ -1,6 +1,8 @@
 /**
  * Drop Core Transfer Engine
  * Standalone, zero-UI, zero-memory-buffering transfer engine for 50-100+ GB transfers.
+ * Implements instant streaming without upfront 100 GB pre-hashing, multi-association WebRTC,
+ * authenticated E2EE with HKDF, leaf hash persistence, and zero whole-file memory usage.
  */
 
 import {
@@ -10,11 +12,11 @@ import {
   EngineConfig,
   IDiskWriter,
 } from './types.js';
-import { TransferCrypto } from './crypto.js';
+import { TransferCrypto, DerivedKeys } from './crypto.js';
 import { Hasher } from './hasher.js';
 import { MerkleTree } from './merkle.js';
 import { FileChunker, ChunkSource, BlobChunkSource } from './chunker.js';
-import { ChunkBitmap, SessionPersistence } from './bitmap.js';
+import { ChunkBitmap, SessionPersistence, StoredSession } from './bitmap.js';
 import { WorkStealingScheduler } from './scheduler.js';
 import { FrameCodec, FrameType } from './transports/types.js';
 import { MultipathController } from './transports/multipath.js';
@@ -36,7 +38,7 @@ export class TransferEngine {
   private state: TransferState = 'idle';
 
   // Subsystems
-  private crypto: TransferCrypto = new TransferCrypto();
+  public crypto: TransferCrypto = new TransferCrypto();
   private chunker: FileChunker | null = null;
   private diskWriter: IDiskWriter | null = null;
   private scheduler: WorkStealingScheduler | null = null;
@@ -46,10 +48,11 @@ export class TransferEngine {
 
   // Active session data
   private manifest: TransferManifest | null = null;
-  private verifiedLeaves: Uint8Array[] = [];
+  private verifiedLeaves: (Uint8Array | undefined)[] = [];
   private wakeLock: any = null;
+  private finalizedMerkleRoot: string | null = null;
 
-  // Speed and ETA calculation
+  // Speed and throughput calculation
   private bytesTransferred = 0;
   private totalBytes = 0;
   private lastProgressTime = 0;
@@ -59,8 +62,8 @@ export class TransferEngine {
 
   constructor(config: EngineConfig = {}, events: TransferEngineEvents = {}) {
     this.config = {
-      defaultChunkSize: 8 * 1024 * 1024, // 8 MB
-      parallelChannels: 8,
+      defaultChunkSize: 4 * 1024 * 1024, // 4 MB chunks default
+      parallelChannels: 6,
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
@@ -84,69 +87,50 @@ export class TransferEngine {
   }
 
   /**
-   * SENDER: Prepares file for transfer, generates key, computes Merkle tree, and starts listening.
+   * SENDER: Prepares file for transfer, derives keys, generates instant manifest,
+   * and begins streaming immediately with 0 delay.
    */
   public async prepareSender(
     sourceOrBlob: ChunkSource | Blob,
     sessionId: string,
     originUrl: string = ''
-  ): Promise<{ manifest: TransferManifest; shareUrl: string; keyFragment: string }> {
+  ): Promise<{ manifest: TransferManifest; shareUrl: string; keyFragment: string; authSecret: string }> {
     this.setState('waiting_peer');
 
-    // 1. Generate E2E encryption key and salt
-    const { saltHex, fragment } = await this.crypto.generateKey();
+    // 1. Generate master key and derive subkeys
+    const { saltHex, fragment, authSecret } = await this.crypto.generateKey();
 
     // 2. Initialize chunker
     const source: ChunkSource =
       'readSlice' in sourceOrBlob ? sourceOrBlob : new BlobChunkSource(sourceOrBlob);
     this.chunker = new FileChunker(source, this.config.defaultChunkSize);
     this.totalBytes = source.size;
+    this.verifiedLeaves = new Array(this.chunker.totalChunks);
 
-    // 3. Generate Merkle tree root and manifest
-    const { manifest, leafHashes } = await this.chunker.generateManifest(
-      sessionId,
-      saltHex,
-      (processed, total) => {
-        if (this.events.onProgress) {
-          this.events.onProgress({
-            state: 'waiting_peer',
-            bytesTransferred: processed,
-            totalBytes: total,
-            chunksCompleted: 0,
-            totalChunks: this.chunker?.totalChunks || 1,
-            speedBps: 0,
-            etaSeconds: 0,
-            merkleRoot: 'computing...',
-            activeTransports: [],
-          });
-        }
-      }
-    );
-
-    this.manifest = manifest;
-    this.verifiedLeaves = leafHashes;
+    // 3. Create instant manifest without 100 GB pre-read delay
+    this.manifest = this.chunker.createInstantManifest(sessionId, saltHex);
 
     // 4. Initialize Scheduler & Multipath
-    this.scheduler = new WorkStealingScheduler(manifest.totalChunks);
+    this.scheduler = new WorkStealingScheduler(this.manifest.totalChunks);
     this.multipath = new MultipathController(this.scheduler);
     this.setupMultipathSenderPump();
 
-    // 5. Initialize WebRTC Manager
+    // 5. Initialize WebRTC Multi-Association Peer Manager
     this.setupWebRTC(true);
 
-    // 6. Initialize HTTP Relay if URL provided
+    // 6. Initialize HTTP Relay if enabled
     if (this.config.relayUrl) {
-      this.httpRelay = new HttpRelayTransport('relay-0', this.config.relayUrl, sessionId);
+      this.httpRelay = new HttpRelayTransport('relay-0', this.config.relayUrl, sessionId, authSecret);
       this.multipath.registerTransport(this.httpRelay, 4, 16);
     }
 
     const shareUrl = `${originUrl}/?code=${sessionId}#key=${fragment}`;
     if (this.events.onManifestReady) {
-      this.events.onManifestReady(manifest, shareUrl, fragment);
+      this.events.onManifestReady(this.manifest, shareUrl, fragment);
     }
 
     this.startProgressTicker();
-    return { manifest, shareUrl, keyFragment: fragment };
+    return { manifest: this.manifest, shareUrl, keyFragment: fragment, authSecret };
   }
 
   /**
@@ -165,19 +149,29 @@ export class TransferEngine {
     // 1. Initialize Crypto from key fragment
     await this.crypto.initFromFragment(keyFragment);
 
-    // 2. Open Disk Writer (preallocates space directly on disk)
+    // 2. Open Disk Writer (preallocates space directly on disk, no RAM buffering)
     await this.diskWriter.open(manifest.name, manifest.size);
 
-    // 3. Load or initialize ChunkBitmap for session resumption
+    // 3. Load ChunkBitmap & persisted leaf hashes for session resumption
     let existingBitmap: ChunkBitmap | undefined;
     const stored = await SessionPersistence.loadSession(manifest.sessionId);
-    if (stored && stored.merkleRoot === manifest.merkleRoot) {
+    if (stored) {
       existingBitmap = ChunkBitmap.fromBase64(stored.bitmapBase64, manifest.totalChunks);
+      if (stored.leafHashes && Array.isArray(stored.leafHashes)) {
+        for (let i = 0; i < stored.leafHashes.length; i++) {
+          const hex = stored.leafHashes[i];
+          if (hex && hex.length === 64) {
+            this.verifiedLeaves[i] = Hasher.fromHex(hex);
+          }
+        }
+      }
     }
 
     this.scheduler = new WorkStealingScheduler(manifest.totalChunks, existingBitmap);
-    this.bytesTransferred = (this.scheduler.getCompletedCount() * manifest.chunkSize);
-    this.bytesTransferred = Math.min(this.bytesTransferred, manifest.size);
+    this.bytesTransferred = Math.min(
+      this.scheduler.getCompletedCount() * manifest.chunkSize,
+      manifest.size
+    );
 
     // 4. Multipath & WebRTC
     this.multipath = new MultipathController(this.scheduler);
@@ -185,7 +179,7 @@ export class TransferEngine {
 
     // 5. Initialize HTTP Relay if enabled
     if (this.config.relayUrl) {
-      this.httpRelay = new HttpRelayTransport('relay-0', this.config.relayUrl, manifest.sessionId);
+      this.httpRelay = new HttpRelayTransport('relay-0', this.config.relayUrl, manifest.sessionId, this.crypto.getAuthSecret());
       this.httpRelay.onFrame = (frame) => this.handleIncomingFrame(frame);
     }
 
@@ -193,7 +187,7 @@ export class TransferEngine {
     this.setState('transferring');
     this.startProgressTicker();
 
-    // If relay enabled, start background pull of any chunks already uploaded to relay
+    // Parallel relay pull worker
     if (this.httpRelay) {
       this.startRelayPullWorker();
     }
@@ -205,11 +199,16 @@ export class TransferEngine {
     this.multipath.onChunkReadyToSend = async (chunkIndex, transport) => {
       try {
         const plaintext = await this.chunker!.readChunk(chunkIndex);
-        const hash = await Hasher.hashChunk(plaintext);
+        // Compute leaf hash on the fly during transmission
+        const leafHash = await Hasher.hashChunk(plaintext);
+        this.verifiedLeaves[chunkIndex] = leafHash;
+
+        // Authenticated AES-256-GCM encryption
         const ciphertext = await this.crypto.encryptChunk(chunkIndex, plaintext);
         const nonce = this.crypto.constructNonce(chunkIndex);
 
-        const frame = FrameCodec.encodeDataFrame(chunkIndex, hash, nonce, ciphertext);
+        // Frame without plaintext hash
+        const frame = FrameCodec.encodeDataFrame(chunkIndex, nonce, ciphertext);
         const sent = await transport.sendFrame(frame);
         return sent;
       } catch (err: any) {
@@ -221,7 +220,8 @@ export class TransferEngine {
 
   private setupWebRTC(isInitiator: boolean): void {
     this.webrtc = new WebRTCPeerManager({
-      channelCount: this.config.parallelChannels || 8,
+      peerConnectionCount: 2, // 2 distinct SCTP associations
+      channelsPerPeer: 3,     // 3 channels each = 6 streams
       iceServers: this.config.iceServers,
       onSignal: (signal) => {
         if (this.events.onSignal) {
@@ -236,7 +236,6 @@ export class TransferEngine {
             this.multipath?.start();
           }
         } else if (state === 'failed' || state === 'disconnected') {
-          // Fall back gracefully to relay if active
           if (this.multipath && this.httpRelay) {
             this.multipath.triggerSchedulePump();
           }
@@ -264,14 +263,14 @@ export class TransferEngine {
   }
 
   /**
-   * Processes incoming binary frames (Data Chunks, ACKs, NACKs).
+   * Processes incoming binary frames (Data Chunks, ACKs, NACKs, Finalize).
    */
   public async handleIncomingFrame(frameData: Uint8Array): Promise<void> {
     const frame = FrameCodec.decodeFrame(frameData);
     if (!frame) return;
 
     if (frame.type === FrameType.CHUNK_ACK) {
-      // SENDER received ACK from receiver
+      // SENDER received ACK
       if (this.scheduler && this.manifest) {
         const chunkLen = Math.min(
           this.manifest.chunkSize,
@@ -282,18 +281,25 @@ export class TransferEngine {
         this.saveCurrentSession();
 
         if (this.scheduler.isComplete()) {
-          this.finalizeTransfer();
+          await this.finalizeSenderTransfer();
         } else {
           this.multipath?.triggerSchedulePump();
         }
       }
     } else if (frame.type === FrameType.CHUNK_NACK) {
-      // SENDER received NACK: re-queue chunk
+      // SENDER received NACK: re-queue
       this.scheduler?.onChunkNack(frame.chunkIndex);
       this.multipath?.triggerSchedulePump();
     } else if (frame.type === FrameType.DATA_CHUNK) {
-      // RECEIVER received chunk payload: decrypt, hash, verify, write to disk
+      // RECEIVER received chunk: decrypt, write directly to disk
       await this.processReceivedChunk(frame);
+    } else if (frame.type === FrameType.MANIFEST_FINALIZE) {
+      // RECEIVER received final Merkle root notification
+      const dec = new TextDecoder();
+      this.finalizedMerkleRoot = dec.decode(frame.payload);
+      if (this.scheduler?.isComplete()) {
+        await this.verifyAndFinalizeReceiver();
+      }
     }
   }
 
@@ -301,37 +307,29 @@ export class TransferEngine {
     if (!this.manifest || !this.diskWriter || !this.scheduler) return;
     const chunkIdx = frame.chunkIndex;
 
-    // Skip if already stored
+    // Skip if already completed
     if (this.scheduler.completedBitmap.has(chunkIdx)) return;
 
     try {
-      // 1. Decrypt chunk
+      // 1. Authenticated AES-256-GCM decryption
       const plaintext = await this.crypto.decryptChunk(chunkIdx, frame.payload);
 
-      // 2. Verify per-chunk hash
+      // 2. Compute leaf hash for final Merkle tree verification
       const computedHash = await Hasher.hashChunk(plaintext);
-      const computedHex = Hasher.toHex(computedHash);
-      const expectedHex = Hasher.toHex(frame.hash);
 
-      if (computedHex !== expectedHex) {
-        console.warn(`Hash mismatch on chunk ${chunkIdx}. Sending NACK.`);
-        this.scheduler.onChunkNack(chunkIdx);
-        return;
-      }
-
-      // 3. Write chunk directly to disk at byte offset
+      // 3. Write chunk directly to disk at byte offset without memory accumulation
       const offset = chunkIdx * this.manifest.chunkSize;
       await this.diskWriter.writeChunk(offset, plaintext);
 
-      // 4. Record leaf hash for whole-file Merkle tree
+      // 4. Record verified leaf hash & update scheduler
       this.verifiedLeaves[chunkIdx] = computedHash;
       this.bytesTransferred += plaintext.length;
       this.scheduler.onChunkAck(chunkIdx, plaintext.length);
 
-      // Save resume checkpoint
+      // 5. Save resume checkpoint with leaf hashes
       this.saveCurrentSession();
 
-      // 5. Send ACK frame back across any active channel
+      // 6. Send ACK frame back
       const ackFrame = FrameCodec.encodeControlFrame(FrameType.CHUNK_ACK, chunkIdx);
       const activeChannels = this.webrtc?.getActiveChannels() || [];
       if (activeChannels.length > 0) {
@@ -339,12 +337,43 @@ export class TransferEngine {
       }
 
       // Check for completion
-      if (this.scheduler.isComplete()) {
+      if (this.scheduler.isComplete() && this.finalizedMerkleRoot) {
         await this.verifyAndFinalizeReceiver();
       }
     } catch (e: any) {
-      console.error(`Decryption/storage error on chunk ${chunkIdx}:`, e);
+      console.error(`Decryption/storage authentication failure on chunk ${chunkIdx}:`, e);
       this.scheduler.onChunkNack(chunkIdx);
+    }
+  }
+
+  private async finalizeSenderTransfer(): Promise<void> {
+    if (!this.manifest) return;
+
+    // Build Merkle tree from accumulated leaf hashes
+    const leaves = this.verifiedLeaves.filter((l): l is Uint8Array => l !== undefined);
+    const tree = new MerkleTree(leaves);
+    const computedRoot = await tree.computeRoot();
+    this.manifest.merkleRoot = computedRoot;
+
+    // Broadcast MANIFEST_FINALIZE frame to receiver
+    const enc = new TextEncoder();
+    const finalizeFrame = FrameCodec.encodeControlFrame(
+      FrameType.MANIFEST_FINALIZE,
+      0,
+      enc.encode(computedRoot)
+    );
+
+    const activeChannels = this.webrtc?.getActiveChannels() || [];
+    for (const ch of activeChannels) {
+      await ch.sendFrame(finalizeFrame);
+    }
+
+    this.setState('complete');
+    this.stopProgressTicker();
+    this.releaseWakeLock();
+
+    if (this.events.onComplete) {
+      this.events.onComplete(computedRoot);
     }
   }
 
@@ -354,112 +383,101 @@ export class TransferEngine {
     this.setState('verifying');
 
     // Compute whole-file Merkle root
-    const tree = new MerkleTree(this.verifiedLeaves);
+    const leaves = this.verifiedLeaves.filter((l): l is Uint8Array => l !== undefined);
+    const tree = new MerkleTree(leaves);
     const computedRoot = await tree.computeRoot();
 
-    if (computedRoot.toLowerCase() !== this.manifest.merkleRoot.toLowerCase()) {
+    const expectedRoot = this.finalizedMerkleRoot || this.manifest.merkleRoot;
+
+    if (expectedRoot && expectedRoot !== 'streaming' && computedRoot.toLowerCase() !== expectedRoot.toLowerCase()) {
       const err = new Error(
-        `Merkle root mismatch! Expected ${this.manifest.merkleRoot}, got ${computedRoot}`
+        `Whole-file Merkle root mismatch! Expected: ${expectedRoot}, Computed: ${computedRoot}`
       );
       this.setState('error');
       if (this.events.onError) this.events.onError(err);
       return;
     }
 
-    // Atomic finalize: rename .part to final file
     await this.diskWriter.finalize(this.manifest.name);
     await SessionPersistence.deleteSession(this.manifest.sessionId);
 
-    this.finalizeTransfer();
-  }
-
-  private finalizeTransfer(): void {
-    this.releaseWakeLock();
-    this.stopProgressTicker();
     this.setState('complete');
-    if (this.events.onComplete && this.manifest) {
-      this.events.onComplete(this.manifest.merkleRoot);
+    this.stopProgressTicker();
+    this.releaseWakeLock();
+
+    if (this.events.onComplete) {
+      this.events.onComplete(computedRoot);
     }
   }
 
-  private async startRelayPullWorker(): Promise<void> {
+  private startRelayPullWorker(): void {
     if (!this.httpRelay || !this.scheduler) return;
 
-    while (this.state === 'transferring' && !this.scheduler.isComplete()) {
-      const missing = this.scheduler.completedBitmap.getMissingIndices();
-      if (missing.length === 0) break;
+    const concurrency = 6; // 6 parallel HTTP range/chunk pulls
+    for (let workerId = 0; workerId < concurrency; workerId++) {
+      (async () => {
+        while (this.state === 'transferring' && !this.scheduler!.isComplete()) {
+          const chunkIndex = this.scheduler!.acquireNextChunk(`relay-worker-${workerId}`);
+          if (chunkIndex === null) {
+            await new Promise((r) => setTimeout(r, 50));
+            continue;
+          }
 
-      const nextIdx = missing[0];
-      const frameData = await this.httpRelay.fetchChunk(nextIdx);
-      if (frameData) {
-        await this.handleIncomingFrame(frameData);
-      } else {
-        // Yield briefly before checking relay again
-        await new Promise((r) => setTimeout(r, 500));
-      }
+          try {
+            const frame = await this.httpRelay!.fetchChunk(chunkIndex);
+            if (frame) {
+              await this.handleIncomingFrame(frame);
+            } else {
+              this.scheduler!.onChunkNack(chunkIndex);
+              await new Promise((r) => setTimeout(r, 200));
+            }
+          } catch {
+            this.scheduler!.onChunkNack(chunkIndex);
+            await new Promise((r) => setTimeout(r, 200));
+          }
+        }
+      })();
     }
   }
 
-  private async saveCurrentSession(): Promise<void> {
+  private saveCurrentSession(): void {
     if (!this.manifest || !this.scheduler) return;
-    try {
-      await SessionPersistence.saveSession({
-        sessionId: this.manifest.sessionId,
-        name: this.manifest.name,
-        size: this.manifest.size,
-        chunkSize: this.manifest.chunkSize,
-        totalChunks: this.manifest.totalChunks,
-        merkleRoot: this.manifest.merkleRoot,
-        bitmapBase64: this.scheduler.completedBitmap.toBase64(),
-        updatedAt: Date.now(),
-      });
-    } catch {}
-  }
+    const leafHexes = this.verifiedLeaves.map((l) => (l ? Hasher.toHex(l) : ''));
 
-  public pause(): void {
-    this.setState('paused');
-    this.multipath?.pause();
-    this.releaseWakeLock();
-  }
-
-  public resume(): void {
-    if (this.state === 'paused') {
-      this.acquireWakeLock();
-      this.setState('transferring');
-      this.multipath?.resume();
-    }
-  }
-
-  public async cancel(): Promise<void> {
-    this.releaseWakeLock();
-    this.stopProgressTicker();
-    this.multipath?.pause();
-    if (this.webrtc) await this.webrtc.close();
-    if (this.httpRelay) await this.httpRelay.close();
-    if (this.diskWriter) await this.diskWriter.abort();
-    this.setState('idle');
+    const session: StoredSession = {
+      sessionId: this.manifest.sessionId,
+      name: this.manifest.name,
+      size: this.manifest.size,
+      chunkSize: this.manifest.chunkSize,
+      totalChunks: this.manifest.totalChunks,
+      merkleRoot: this.finalizedMerkleRoot || this.manifest.merkleRoot,
+      bitmapBase64: this.scheduler.completedBitmap.toBase64(),
+      leafHashes: leafHexes,
+      updatedAt: Date.now(),
+    };
+    SessionPersistence.saveSession(session);
   }
 
   private startProgressTicker(): void {
-    this.lastProgressTime = Date.now();
+    if (this.progressInterval) clearInterval(this.progressInterval);
+    this.lastProgressTime = performance.now();
     this.lastProgressBytes = this.bytesTransferred;
 
     this.progressInterval = setInterval(() => {
-      const now = Date.now();
+      const now = performance.now();
       const elapsedSec = (now - this.lastProgressTime) / 1000;
       if (elapsedSec >= 0.5) {
         const deltaBytes = this.bytesTransferred - this.lastProgressBytes;
-        const instantBps = deltaBytes / elapsedSec;
+        const instantSpeed = deltaBytes / elapsedSec;
         this.currentSpeedBps = this.currentSpeedBps === 0
-          ? instantBps
-          : this.currentSpeedBps * 0.7 + instantBps * 0.3;
+          ? instantSpeed
+          : this.currentSpeedBps * 0.7 + instantSpeed * 0.3;
 
         this.lastProgressTime = now;
         this.lastProgressBytes = this.bytesTransferred;
+        this.emitProgress();
       }
-
-      this.emitProgress();
-    }, 500);
+    }, 250);
   }
 
   private stopProgressTicker(): void {
@@ -471,14 +489,15 @@ export class TransferEngine {
 
   private emitProgress(): void {
     if (!this.events.onProgress) return;
-
-    const remainingBytes = Math.max(0, this.totalBytes - this.bytesTransferred);
-    const etaSeconds = this.currentSpeedBps > 0
-      ? Math.ceil(remainingBytes / this.currentSpeedBps)
-      : 0;
-
+    const remaining = Math.max(0, this.totalBytes - this.bytesTransferred);
+    const etaSeconds = this.currentSpeedBps > 0 ? Math.ceil(remaining / this.currentSpeedBps) : 0;
+    const totalChunks = this.scheduler ? this.scheduler.totalChunks : 1;
     const completedChunks = this.scheduler ? this.scheduler.getCompletedCount() : 0;
-    const totalChunks = this.manifest ? this.manifest.totalChunks : 1;
+
+    const activeTransports = [
+      ...(this.webrtc?.getActiveChannels().map((ch) => ch.name) || []),
+      ...(this.httpRelay ? [this.httpRelay.name] : []),
+    ];
 
     this.events.onProgress({
       state: this.state,
@@ -486,18 +505,39 @@ export class TransferEngine {
       totalBytes: this.totalBytes,
       chunksCompleted: completedChunks,
       totalChunks,
-      speedBps: this.currentSpeedBps,
+      speedBps: Math.round(this.currentSpeedBps),
       etaSeconds,
-      merkleRoot: this.manifest?.merkleRoot || '',
-      activeTransports: this.multipath?.getTransportNames() || [],
+      merkleRoot: this.finalizedMerkleRoot || this.manifest?.merkleRoot || '',
+      activeTransports,
     });
+  }
+
+  public pause(): void {
+    this.setState('paused');
+    this.multipath?.pause();
+  }
+
+  public resume(): void {
+    this.setState('transferring');
+    this.multipath?.resume();
+  }
+
+  public async cancel(): Promise<void> {
+    this.stopProgressTicker();
+    this.releaseWakeLock();
+    this.multipath?.stop();
+    await this.webrtc?.close();
+    await this.diskWriter?.abort();
+    this.setState('idle');
   }
 
   private async acquireWakeLock(): Promise<void> {
     if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
       try {
         this.wakeLock = await (navigator as any).wakeLock.request('screen');
-      } catch {}
+      } catch (e) {
+        console.warn('Wake Lock request skipped:', e);
+      }
     }
   }
 

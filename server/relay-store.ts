@@ -1,21 +1,27 @@
 /**
  * Disk-Backed Zero-Knowledge Chunk Store for Drop Relay
- * Stores client-encrypted chunks directly to disk with TTL cleanup.
- * The server holds zero keys and can never decrypt the stored chunks.
+ * Streams client-encrypted chunks directly to disk with TTL cleanup.
+ * Atomic file writes (.tmp -> rename) ensure readers never see partial chunks.
+ * Zero whole-chunk memory buffering.
  */
 
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
+import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
 
 export interface RelayStoreConfig {
   baseDir?: string;
   defaultTtlMs?: number; // default 24 hours
   maxChunkSizeBytes?: number; // max 64 MB
+  maxSessionSizeBytes?: number; // max 100 GB
+  maxChunkCount?: number; // max 10,000 chunks
 }
 
 export interface SessionMetadata {
   sessionId: string;
+  authSecret?: string;
   createdAt: number;
   expiresAt: number;
   totalSize: number;
@@ -26,12 +32,16 @@ export class RelayChunkStore {
   private baseDir: string;
   private defaultTtlMs: number;
   private maxChunkSizeBytes: number;
+  private maxSessionSizeBytes: number;
+  private maxChunkCount: number;
   private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(config: RelayStoreConfig = {}) {
     this.baseDir = path.resolve(config.baseDir || './.drop_chunks');
     this.defaultTtlMs = config.defaultTtlMs || 24 * 60 * 60 * 1000;
     this.maxChunkSizeBytes = config.maxChunkSizeBytes || 64 * 1024 * 1024;
+    this.maxSessionSizeBytes = config.maxSessionSizeBytes || 100 * 1024 * 1024 * 1024; // 100 GB quota
+    this.maxChunkCount = config.maxChunkCount || 10000;
 
     this.ensureBaseDir();
     this.startCleanupTimer();
@@ -43,128 +53,138 @@ export class RelayChunkStore {
     }
   }
 
-  private getSessionDir(sessionId: string): string {
-    // Sanitize session ID
+  public getSessionDir(sessionId: string): string {
     const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
     return path.join(this.baseDir, safeId);
   }
 
-  private getChunkPath(sessionId: string, chunkIndex: number): string {
+  public getChunkPath(sessionId: string, chunkIndex: number): string {
     return path.join(this.getSessionDir(sessionId), `chunk_${chunkIndex}.bin`);
   }
 
   /**
-   * Saves an encrypted chunk directly to disk.
+   * Registers a session with an expected authSecret and quota limits.
    */
-  public async putChunk(sessionId: string, chunkIndex: number, data: Buffer | Uint8Array): Promise<number> {
-    if (data.length > this.maxChunkSizeBytes) {
-      throw new Error(`Chunk size ${data.length} exceeds maximum limit of ${this.maxChunkSizeBytes}`);
-    }
-
+  public async registerSession(sessionId: string, authSecret?: string): Promise<void> {
     const sessionDir = this.getSessionDir(sessionId);
     await fs.mkdir(sessionDir, { recursive: true });
 
-    const chunkPath = this.getChunkPath(sessionId, chunkIndex);
-    await fs.writeFile(chunkPath, data);
-
-    // Update session expiry timestamp
     const metaPath = path.join(sessionDir, 'meta.json');
     const now = Date.now();
     const meta: SessionMetadata = {
       sessionId,
+      authSecret,
       createdAt: now,
       expiresAt: now + this.defaultTtlMs,
       totalSize: 0,
       chunkCount: 0,
     };
-    try {
-      await fs.writeFile(metaPath, JSON.stringify(meta), 'utf-8');
-    } catch {}
-
-    return data.length;
+    await fs.writeFile(metaPath, JSON.stringify(meta), 'utf-8');
   }
 
-  /**
-   * Reads an encrypted chunk from disk. Supports byte range slice.
-   */
-  public async getChunk(
-    sessionId: string,
-    chunkIndex: number,
-    range?: { start: number; end: number }
-  ): Promise<{ data: Buffer; totalSize: number } | null> {
-    const chunkPath = this.getChunkPath(sessionId, chunkIndex);
+  public async getSessionMeta(sessionId: string): Promise<SessionMetadata | null> {
+    const metaPath = path.join(this.getSessionDir(sessionId), 'meta.json');
     try {
-      const stats = await fs.stat(chunkPath);
-      const totalSize = stats.size;
-
-      if (range) {
-        const start = Math.max(0, range.start);
-        const end = Math.min(totalSize - 1, range.end);
-        const length = end - start + 1;
-        const buffer = Buffer.alloc(length);
-
-        const handle = await fs.open(chunkPath, 'r');
-        await handle.read(buffer, 0, length, start);
-        await handle.close();
-
-        return { data: buffer, totalSize };
-      } else {
-        const data = await fs.readFile(chunkPath);
-        return { data, totalSize };
-      }
-    } catch (e: any) {
-      if (e.code === 'ENOENT') return null;
-      throw e;
+      const data = await fs.readFile(metaPath, 'utf-8');
+      return JSON.parse(data);
+    } catch {
+      return null;
     }
   }
 
   /**
-   * Deletes all chunks for a completed session.
+   * Streams an encrypted chunk directly to a .tmp file and renames it atomically upon completion.
+   * Zero whole-chunk buffering in Node.js memory.
    */
-  public async deleteSession(sessionId: string): Promise<void> {
+  public async putChunkStream(
+    sessionId: string,
+    chunkIndex: number,
+    stream: Readable
+  ): Promise<number> {
     const sessionDir = this.getSessionDir(sessionId);
-    try {
-      await fs.rm(sessionDir, { recursive: true, force: true });
-    } catch {}
+    await fs.mkdir(sessionDir, { recursive: true });
+
+    const chunkPath = this.getChunkPath(sessionId, chunkIndex);
+    const tempPath = path.join(sessionDir, `chunk_${chunkIndex}.tmp.${Date.now()}`);
+
+    // Stream directly to temp file
+    const writeStream = fsSync.createWriteStream(tempPath);
+    await pipeline(stream, writeStream);
+
+    const stats = await fs.stat(tempPath);
+    if (stats.size > this.maxChunkSizeBytes) {
+      await fs.unlink(tempPath).catch(() => {});
+      throw new Error(`Chunk size ${stats.size} exceeds maximum limit of ${this.maxChunkSizeBytes}`);
+    }
+
+    // Atomic rename: guarantees readers never see partial chunks
+    await fs.rename(tempPath, chunkPath);
+
+    return stats.size;
   }
 
   /**
-   * Periodic TTL cleanup pruning sessions older than 24h.
+   * Returns a readable stream for the requested chunk with optional byte-range slicing.
    */
-  public async pruneExpired(): Promise<number> {
-    let prunedCount = 0;
+  public async getChunkStream(
+    sessionId: string,
+    chunkIndex: number,
+    range?: { start: number; end: number }
+  ): Promise<{ stream: fsSync.ReadStream; totalSize: number } | null> {
+    const chunkPath = this.getChunkPath(sessionId, chunkIndex);
     try {
-      const sessions = await fs.readdir(this.baseDir);
+      const stats = await fs.stat(chunkPath);
+      const stream = fsSync.createReadStream(chunkPath, range ? { start: range.start, end: range.end } : undefined);
+      return { stream, totalSize: stats.size };
+    } catch {
+      return null;
+    }
+  }
+
+  public async deleteSession(sessionId: string): Promise<boolean> {
+    const sessionDir = this.getSessionDir(sessionId);
+    try {
+      await fs.rm(sessionDir, { recursive: true, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private startCleanupTimer(): void {
+    this.cleanupInterval = setInterval(() => {
+      this.purgeExpiredSessions().catch(console.error);
+    }, 15 * 60 * 1000); // Check every 15 minutes
+  }
+
+  public async purgeExpiredSessions(): Promise<number> {
+    let purged = 0;
+    try {
+      const entries = await fs.readdir(this.baseDir, { withFileTypes: true });
       const now = Date.now();
 
-      for (const s of sessions) {
-        const metaPath = path.join(this.baseDir, s, 'meta.json');
-        try {
-          const content = await fs.readFile(metaPath, 'utf-8');
-          const meta: SessionMetadata = JSON.parse(content);
-          if (now > meta.expiresAt) {
-            await fs.rm(path.join(this.baseDir, s), { recursive: true, force: true });
-            prunedCount++;
-          }
-        } catch {
-          // If no meta or corrupted, check directory mtime
-          const stat = await fs.stat(path.join(this.baseDir, s));
-          if (now - stat.mtimeMs > this.defaultTtlMs) {
-            await fs.rm(path.join(this.baseDir, s), { recursive: true, force: true });
-            prunedCount++;
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const metaPath = path.join(this.baseDir, entry.name, 'meta.json');
+          try {
+            const data = await fs.readFile(metaPath, 'utf-8');
+            const meta: SessionMetadata = JSON.parse(data);
+            if (now > meta.expiresAt) {
+              await fs.rm(path.join(this.baseDir, entry.name), { recursive: true, force: true });
+              purged++;
+            }
+          } catch {
+            // No meta file or malformed: check folder age
+            const stat = await fs.stat(path.join(this.baseDir, entry.name));
+            if (now - stat.mtimeMs > this.defaultTtlMs) {
+              await fs.rm(path.join(this.baseDir, entry.name), { recursive: true, force: true });
+              purged++;
+            }
           }
         }
       }
     } catch {}
-    return prunedCount;
-  }
-
-  private startCleanupTimer(): void {
-    // Run cleanup every 30 minutes
-    this.cleanupInterval = setInterval(() => {
-      this.pruneExpired().catch((e) => console.error('Relay cleanup error:', e));
-    }, 30 * 60 * 1000);
-    this.cleanupInterval.unref();
+    return purged;
   }
 
   public close(): void {

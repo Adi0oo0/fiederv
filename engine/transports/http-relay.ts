@@ -18,11 +18,14 @@ export class HttpRelayTransport implements ITransport {
   public onDrain?: () => void;
   public onError?: (err: Error) => void;
 
-  constructor(id: string, baseUrl: string, sessionId: string) {
+  private authSecret?: string;
+
+  constructor(id: string, baseUrl: string, sessionId: string, authSecret?: string) {
     this.id = id;
     this.name = `HTTP-Relay-${id}`;
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.sessionId = sessionId;
+    this.authSecret = authSecret;
   }
 
   public isConnected(): boolean {
@@ -39,13 +42,18 @@ export class HttpRelayTransport implements ITransport {
     this.activeUploads++;
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/octet-stream',
+        'X-Drop-Chunk': decoded.chunkIndex.toString(),
+      };
+      if (this.authSecret) {
+        headers['Authorization'] = `Bearer ${this.authSecret}`;
+      }
+
       const res = await fetch(url, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Drop-Chunk': decoded.chunkIndex.toString(),
-        },
-        body: frame,
+        headers,
+        body: frame as any,
       });
 
       this.activeUploads--;
@@ -78,7 +86,11 @@ export class HttpRelayTransport implements ITransport {
     const url = `${this.baseUrl}/api/relay/${this.sessionId}/chunk/${chunkIndex}`;
 
     try {
-      const res = await fetch(url);
+      const headers: Record<string, string> = {};
+      if (this.authSecret) {
+        headers['Authorization'] = `Bearer ${this.authSecret}`;
+      }
+      const res = await fetch(url, { headers });
       if (res.status === 404) {
         // Chunk not yet arrived at relay
         return null;
